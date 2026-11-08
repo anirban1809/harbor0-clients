@@ -91,3 +91,15 @@ does the same with `.env.cloud` (`AWS_REGION`, `WEB_ORIGIN`, `WEB_CERT_ARN`).
 `npm run release:desktop` builds and uploads the installers to harbor0.com/downloads, tags the
 release here and updates the landing site's download links in the backend checkout, committing and
 pushing them on its `main`. See the comment at the top of `scripts/release-desktop.ts`.
+
+## License
+
+Copyright (C) 2026 Anirban Deb Singha.
+
+The code is licensed under the [GNU Affero General Public License v3.0](LICENSE) only. You can
+use, study, change and share it, but versions you distribute, or run as a service for other people,
+must be released under the same license with their source code. The harbor0 name and logo are not
+covered by the license; see [TRADEMARKS.md](TRADEMARKS.md).
+
+Third-party packages keep their own licenses. Issues are welcome; pull requests from outside the
+project aren't accepted for now.
