@@ -10,6 +10,8 @@ export default ts.config(
       '.cloud/**',
       'packages/api-client/src/generated.ts',
       'apps/web/next-env.d.ts',
+      // pdf.js runtime files, copied from node_modules by apps/web/scripts/copy-pdfjs.mjs.
+      'apps/web/public/pdfjs/**',
       // The linked backend checkout (scripts/backend.ts) is linted in its own repository.
       'backend/**',
       'apps/backend/**',

@@ -9,10 +9,10 @@ import { harborEnv } from './environment';
 //   HARBOR_ENV=staging npx cdk deploy HarborClientsGitHubStaging --app 'npx tsx infra/github.ts'
 // then set the DeployRoleArn output as the PRODUCTION_/STAGING_AWS_ROLE_ARN repository variable.
 const repository = 'anirban1809/harbor0-clients';
-// GitHub names the repository either plainly or, with immutable subjects turned on, by
-// login@id/name@id, which a re-created repository with the same name can't match. Both are
-// accepted until the repository's subject format is settled; a rename needs this updated.
-const subjectRepositories = [repository, 'anirban1809@43294429/harbor0-clients@REPOSITORY_ID'];
+// The repository uses GitHub's immutable OIDC subject, which names the owner and repository by
+// login@id, so a re-created repository with the same name cannot assume the role. A rename changes
+// the subject: update this and redeploy the stack.
+const subjectRepository = 'anirban1809@43294429/harbor0-clients@1450115973';
 const branch = harborEnv.branch;
 const label = harborEnv.production ? 'Production' : 'Staging';
 const app = new App();
@@ -28,9 +28,7 @@ const role = new iam.Role(stack, `${label}Deploy`, {
   assumedBy: new iam.WebIdentityPrincipal(provider.openIdConnectProviderArn, {
     StringEquals: {
       'token.actions.githubusercontent.com:aud': 'sts.amazonaws.com',
-      'token.actions.githubusercontent.com:sub': subjectRepositories.map(
-        (subject) => `repo:${subject}:ref:refs/heads/${branch}`,
-      ),
+      'token.actions.githubusercontent.com:sub': `repo:${subjectRepository}:ref:refs/heads/${branch}`,
     },
   }),
 });

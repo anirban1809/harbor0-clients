@@ -1,0 +1,103 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "api",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": ["run", "dev:api"],
+      "port": 8787
+    },
+    {
+      "name": "web",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": ["run", "dev:web"],
+      "port": 3000
+    },
+    {
+      "name": "web-local",
+      "runtimeExecutable": "env",
+      "runtimeArgs": [
+        "API_URL=http://127.0.0.1:8787",
+        "APP_ORIGIN=http://localhost:3200",
+        "npm",
+        "run",
+        "dev",
+        "-w",
+        "@harbor/web",
+        "--",
+        "-p",
+        "3200"
+      ],
+      "port": 3200
+    },
+    {
+      "name": "web-local-3000",
+      "runtimeExecutable": "env",
+      "runtimeArgs": [
+        "API_URL=http://127.0.0.1:8787",
+        "APP_ORIGIN=http://localhost:3000",
+        "npm",
+        "run",
+        "dev",
+        "-w",
+        "@harbor/web",
+        "--",
+        "-p",
+        "3000"
+      ],
+      "port": 3000
+    },
+    {
+      "name": "web-cognito",
+      "runtimeExecutable": "env",
+      "runtimeArgs": [
+        "API_URL=http://127.0.0.1:8797",
+        "APP_ORIGIN=http://localhost:3400",
+        "npm",
+        "run",
+        "dev",
+        "-w",
+        "@harbor/web",
+        "--",
+        "-p",
+        "3400"
+      ],
+      "port": 3400
+    },
+    {
+      "name": "web-alt",
+      "runtimeExecutable": "env",
+      "runtimeArgs": [
+        "API_URL=http://127.0.0.1:8807",
+        "APP_ORIGIN=http://localhost:3210",
+        "npm",
+        "run",
+        "dev",
+        "-w",
+        "@harbor/web",
+        "--",
+        "-p",
+        "3210"
+      ],
+      "port": 3210
+    },
+    {
+      "name": "web-e2ee-mac",
+      "runtimeExecutable": "env",
+      "runtimeArgs": [
+        "API_URL=http://127.0.0.1:8847",
+        "APP_ORIGIN=http://localhost:3000",
+        "NEXT_DIST_DIR=.next-e2ee-mac",
+        "npm",
+        "run",
+        "dev",
+        "-w",
+        "@harbor/web",
+        "--",
+        "-p",
+        "3000"
+      ],
+      "port": 3000
+    }
+  ]
+}
