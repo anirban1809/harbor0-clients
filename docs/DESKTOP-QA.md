@@ -25,7 +25,7 @@ The normal `npm run check` run passes 32 tests and deliberately skips the two in
 
 Pause one sync root, create a cloud folder within it, run a sync cycle, then resume the root and sync again. The new folder remains absent locally. The shared feed cursor advances while paused roots are skipped, and changing root settings does not reconcile them.
 
-Evidence: resilience check “Paused roots catch up on remote changes after resuming.” See [sync.ts:136](/Users/anirban/Documents/Code/files/apps/desktop/src/sync.ts:136) and [main.ts:390](/Users/anirban/Documents/Code/files/apps/desktop/src/main.ts:390).
+Evidence: resilience check “Paused roots catch up on remote changes after resuming.” See [sync.ts:136](../apps/desktop/src/sync.ts#L136) and [main.ts:390](../apps/desktop/src/main.ts#L390).
 
 ### 2. High: removing an exclusion misses cloud content
 
@@ -37,37 +37,37 @@ Evidence: resilience check “Removing an exclusion downloads cloud content prev
 
 Start watching a root with `Excluded` excluded. Remove the exclusion and create `Excluded/new.txt`. No upload job appears. The watcher closes over the original root configuration, while settings updates only replace the database record.
 
-Evidence: resilience check “Removing an exclusion makes the watcher pick up local files again.” See [sync.ts:46](/Users/anirban/Documents/Code/files/apps/desktop/src/sync.ts:46) and [main.ts:390](/Users/anirban/Documents/Code/files/apps/desktop/src/main.ts:390).
+Evidence: resilience check “Removing an exclusion makes the watcher pick up local files again.” See [sync.ts:46](../apps/desktop/src/sync.ts#L46) and [main.ts:390](../apps/desktop/src/main.ts#L390).
 
 ### 4. Medium: moving a cloud file outside a mapped root leaves its old local copy
 
 Sync a file within a root, move it in the cloud to a folder outside that root, then sync. The old local file and mapping remain. The engine returns when the new location is outside the root without handling the existing mapping. This was reproduced with the engine's supported non-null remote-root mapping; the current desktop picker creates sync roots at the account root.
 
-Evidence: resilience check “Moving a cloud file out of a sync root removes its old local copy.” See [sync.ts:372](/Users/anirban/Documents/Code/files/apps/desktop/src/sync.ts:372).
+Evidence: resilience check “Moving a cloud file out of a sync root removes its old local copy.” See [sync.ts:372](../apps/desktop/src/sync.ts#L372).
 
 ### 5. Medium: opening a favorite folder does not browse its children
 
 Favorite a folder containing a non-favorite file, open Favorites, and click that folder. The breadcrumb changes, but the listing still contains favorites. The renderer updates the folder trail without changing the section, so it requests the favorites endpoint again.
 
-Evidence: functional check “Opening a favorite folder navigates to its children.” See [renderer.tsx:51](/Users/anirban/Documents/Code/files/apps/desktop/src/renderer.tsx:51) and [renderer.tsx:245](/Users/anirban/Documents/Code/files/apps/desktop/src/renderer.tsx:245). A screenshot is saved in `test-results/desktop-functional/failure-12.png`.
+Evidence: functional check “Opening a favorite folder navigates to its children.” See [renderer.tsx:51](../apps/desktop/src/renderer.tsx#L51) and [renderer.tsx:245](../apps/desktop/src/renderer.tsx#L245). A screenshot is saved in `test-results/desktop-functional/failure-12.png`.
 
 ### 6. Medium: browser sign-in failures are invisible
 
 Start browser sign-in and deliver an invalid-state callback. The main process rejects the callback correctly and emits `harbor:error`, but the desktop shows no error. Cancellation and keychain failures use the same unhandled error channel.
 
-Evidence: auth/UI check “Browser sign-in errors are displayed in the desktop window.” See [preload.ts:26](/Users/anirban/Documents/Code/files/apps/desktop/src/preload.ts:26); it exposes status/authenticated listeners but no error listener. OAuth provider responses were simulated for these protocol checks.
+Evidence: auth/UI check “Browser sign-in errors are displayed in the desktop window.” See [preload.ts:26](../apps/desktop/src/preload.ts#L26); it exposes status/authenticated listeners but no error listener. OAuth provider responses were simulated for these protocol checks.
 
 ### 7. Medium: tray “Send a file” has no connected renderer action
 
 Deliver the same `harbor:send` event used by the tray menu. Neither a file picker nor a send dialog opens. There is no preload/renderer subscription for this event. The tray event path was exercised programmatically; clicking the native tray menu itself was not automated.
 
-Evidence: auth/UI check “Tray Send a file event opens a picker or a send dialog.” See [main.ts:246](/Users/anirban/Documents/Code/files/apps/desktop/src/main.ts:246) and [preload.ts:26](/Users/anirban/Documents/Code/files/apps/desktop/src/preload.ts:26).
+Evidence: auth/UI check “Tray Send a file event opens a picker or a send dialog.” See [main.ts:246](../apps/desktop/src/main.ts#L246) and [preload.ts:26](../apps/desktop/src/preload.ts#L26).
 
 ### 8. Medium: Drive silently stops after the first 100 children
 
 Create 101 children in a folder and open it in the desktop. Only 100 are rendered. The API returns the last item on a second page, but the renderer discards `nextCursor` and provides no pagination control.
 
-Evidence: auth/UI check “A Drive folder with 101 children exposes every item.” See [renderer.tsx:56](/Users/anirban/Documents/Code/files/apps/desktop/src/renderer.tsx:56). The same response handling is shared by other listings, but their larger-page cases were not separately exercised.
+Evidence: auth/UI check “A Drive folder with 101 children exposes every item.” See [renderer.tsx:56](../apps/desktop/src/renderer.tsx#L56). The same response handling is shared by other listings, but their larger-page cases were not separately exercised.
 
 ### 9. Build blocker: the standard macOS packaging command fails
 
@@ -112,8 +112,8 @@ Each extended command currently exits with status 1 because of the confirmed app
 
 Machine-readable results and screenshots:
 
-- [Functional results](/Users/anirban/Documents/Code/files/test-results/desktop-functional/results.json)
-- [Resilience results](/Users/anirban/Documents/Code/files/test-results/desktop-resilience/results.json)
-- [Auth and UI results](/Users/anirban/Documents/Code/files/test-results/desktop-auth-and-ui/results.json)
-- [Signed-in screenshot](/Users/anirban/Documents/Code/files/test-results/desktop-functional/signed-in.png)
-- [Diagnostics sample](/Users/anirban/Documents/Code/files/test-results/desktop-functional/diagnostics.json)
+- [Functional results](../test-results/desktop-functional/results.json)
+- [Resilience results](../test-results/desktop-resilience/results.json)
+- [Auth and UI results](../test-results/desktop-auth-and-ui/results.json)
+- [Signed-in screenshot](../test-results/desktop-functional/signed-in.png)
+- [Diagnostics sample](../test-results/desktop-functional/diagnostics.json)
