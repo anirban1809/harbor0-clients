@@ -1,0 +1,24 @@
+node_modules/
+.env
+.env.*
+!.env.example
+!.env.staging.example
+.next/
+# Second dev servers (NEXT_DIST_DIR) build here.
+.next-*/
+# The linked harbor0-src checkout (npm run backend:link), or CI's checkout of it.
+/backend
+/apps/backend
+dist/
+release/
+cdk.out/
+coverage/
+playwright-report/
+test-results/
+*.sqlite*
+*.tsbuildinfo
+.DS_Store
+.cloud/
+apps/desktop/.dev-runtime/
+# pdf.js runtime assets, copied from node_modules by apps/web/scripts/copy-pdfjs.mjs
+apps/web/public/pdfjs/

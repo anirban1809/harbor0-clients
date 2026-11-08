@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Launcher icon foreground. Drawn from assets/branding/logo.svg: the open ring and the vessel inside. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android" android:width="108dp" android:height="108dp" android:viewportWidth="108" android:viewportHeight="108">
+    <group android:scaleX="1.55" android:scaleY="1.55" android:translateX="16.8" android:translateY="16.8">
+        <path android:pathData="M38.772,21.395 A15,15 0 1,1 22.947,9.037" android:strokeColor="#23272A" android:strokeWidth="7" android:strokeLineCap="round" />
+        <path android:pathData="M24,19 a5,5 0 1,1 0,10 a5,5 0 1,1 0,-10z" android:fillColor="#23272A" />
+    </group>
+</vector>

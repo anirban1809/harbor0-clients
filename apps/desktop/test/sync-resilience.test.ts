@@ -1,0 +1,398 @@
+import { it, expect, vi } from 'vitest';
+import { chmod, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
+import { createHash } from 'node:crypto';
+import { ApiClient, ApiError } from '@harbor/api-client';
+import type { DriveItem } from '@harbor/contracts';
+import { Journal, type Root } from '../src/journal';
+import { SyncEngine } from '../src/sync';
+import { internalPath } from '../src/paths';
+import {
+  folderState,
+  globalSyncState,
+  syncIssueCode,
+  WAITING,
+  type SyncFolder,
+} from '../src/sync-state';
+
+const item = (overrides: Partial<DriveItem>): DriveItem =>
+  ({
+    id: 'item',
+    ownerUserId: 'alice',
+    parentId: 'remote',
+    name: 'item',
+    normalizedName: 'item',
+    type: 'FILE',
+    mimeType: 'text/plain',
+    sizeBytes: 1,
+    currentVersionId: 'version',
+    revision: 2,
+    favorite: false,
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+    deletedAt: null,
+    ...overrides,
+  }) as DriveItem;
+
+async function fixture() {
+  const directory = await mkdtemp(path.join(os.tmpdir(), 'harbor-resilience-'));
+  const local = path.join(directory, 'synced');
+  await mkdir(local);
+  const journal = new Journal(path.join(directory, 'journal.sqlite'));
+  const root: Root = {
+    id: 'root',
+    localPath: local,
+    remoteId: 'remote',
+    mode: 'sync',
+    paused: false,
+    excluded: [],
+  };
+  journal.root(root);
+  const folder = (): SyncFolder => ({
+    ...journal.roots()[0],
+    localPathDisplayName: 'synced',
+    fileCount: 0,
+    folderCount: 0,
+  });
+  return {
+    local,
+    journal,
+    root,
+    folder,
+    async close() {
+      journal.close();
+      await rm(directory, { recursive: true, force: true });
+    },
+  };
+}
+
+// chmod can't take away read access on Windows, so the file would upload normally there.
+it.skipIf(process.platform === 'win32')(
+  'keeps syncing other work when one file cannot be read',
+  async () => {
+    const { local, journal, root, close } = await fixture();
+    const requests: string[] = [];
+    const api = new ApiClient(async (endpoint, init) => {
+      requests.push(`${init?.method ?? 'GET'} ${endpoint}`);
+      return endpoint.startsWith('/v1/sync/changes')
+        ? { changes: [], nextCursor: 7, hasMore: false }
+        : {};
+    });
+    const engine = new SyncEngine(api, journal, 'device', () => {});
+    try {
+      await writeFile(path.join(local, 'locked.txt'), 'secret');
+      await chmod(path.join(local, 'locked.txt'), 0o000);
+      journal.enqueue(root.id, 'locked.txt', 'upsert');
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      journal.putFile({
+        rootId: root.id,
+        relativePath: 'gone.txt',
+        itemId: 'gone',
+        revision: 1,
+        hash: 'hash',
+        type: 'FILE',
+      });
+      journal.enqueue(root.id, 'gone.txt', 'delete');
+      await engine.tick();
+      // The later deletion and the remote feed still ran.
+      expect(requests).toContain('DELETE /v1/drive/items/gone');
+      expect(journal.get('cursor')).toBe(7);
+      expect(engine.state.lastSync).toBeTruthy();
+      const [failed] = journal.jobs();
+      expect(journal.jobs()).toHaveLength(1);
+      expect(failed).toMatchObject({ relativePath: 'locked.txt', attempts: 1 });
+      expect(failed.payload.retryAt).toBeGreaterThan(Date.now());
+      expect(engine.state.issues).toEqual([
+        expect.objectContaining({
+          code: 'PERMISSION_DENIED',
+          scope: 'item',
+          jobId: failed.id,
+          relativePath: 'locked.txt',
+        }),
+      ]);
+      // The failed file waits for its retry time rather than being hammered every tick.
+      await engine.tick();
+      expect(journal.jobs()[0].attempts).toBe(1);
+      expect(engine.state.issues).toHaveLength(1);
+      // Resuming retries immediately; once readable, the problem clears by itself.
+      engine.pause(true);
+      engine.pause(false);
+      expect(journal.jobs()[0].payload.retryAt).toBeUndefined();
+    } finally {
+      await chmod(path.join(local, 'locked.txt'), 0o600).catch(() => {});
+      await engine.stop();
+      await close();
+    }
+  },
+);
+
+// chmod can't take away read access on Windows.
+it.skipIf(process.platform === 'win32')(
+  'skips a subfolder it may not read without deleting what was synced from it',
+  async () => {
+    const { local, journal, root, close } = await fixture();
+    const requests: string[] = [];
+    const api = new ApiClient(async (endpoint, init) => {
+      requests.push(`${init?.method ?? 'GET'} ${endpoint}`);
+      return endpoint.startsWith('/v1/sync/changes')
+        ? { changes: [], nextCursor: 7, hasMore: false }
+        : {};
+    });
+    const engine = new SyncEngine(api, journal, 'device', () => {});
+    await mkdir(path.join(local, 'Private'));
+    await writeFile(path.join(local, 'Private', 'old.txt'), 'synced earlier');
+    await writeFile(path.join(local, 'notes.txt'), 'new');
+    for (const [relativePath, type] of [
+      ['Private', 'FOLDER'],
+      ['Private/old.txt', 'FILE'],
+    ] as const)
+      journal.putFile({
+        rootId: root.id,
+        relativePath,
+        itemId: relativePath,
+        revision: 1,
+        hash: null,
+        type,
+      });
+    await chmod(path.join(local, 'Private'), 0o000);
+    try {
+      await engine.tick();
+      expect(requests.some((request) => request.startsWith('DELETE'))).toBe(false);
+      expect(journal.pendingJob(root.id, 'Private/old.txt', 'delete')).toBeUndefined();
+      expect(journal.file(root.id, 'Private/old.txt')).toBeTruthy();
+      expect(engine.state.issues).toContainEqual(
+        expect.objectContaining({
+          code: 'PERMISSION_DENIED',
+          scope: 'item',
+          relativePath: 'Private',
+        }),
+      );
+      // The rest of the folder was still scanned.
+      expect(requests.some((request) => request.includes('/v1/uploads'))).toBe(true);
+    } finally {
+      await chmod(path.join(local, 'Private'), 0o755).catch(() => {});
+      await engine.stop();
+      await close();
+    }
+  },
+);
+
+it('lists files nested too deep for harbor0 as one problem and retries them a day later', async () => {
+  const { local, journal, root, close } = await fixture();
+  const api = new ApiClient(async (endpoint, init) => {
+    if (endpoint.startsWith('/v1/sync/changes'))
+      return { changes: [], nextCursor: 1, hasMore: false };
+    if (init?.method === 'POST' && !endpoint.startsWith('/v1/sync/'))
+      throw new ApiError('PATH_TOO_DEEP', 'Folders can be nested up to 32 levels.', 400);
+    return {};
+  });
+  const engine = new SyncEngine(api, journal, 'device', () => {});
+  try {
+    const deep = path.join(local, 'Archive', 'a', 'b');
+    await mkdir(deep, { recursive: true });
+    for (const name of ['one.txt', 'two.txt', 'three.txt']) {
+      await writeFile(path.join(deep, name), name);
+      journal.enqueue(root.id, `Archive/a/b/${name}`, 'upsert');
+    }
+    await engine.tick();
+    const deepIssues = engine.state.issues.filter((issue) => issue.id === `${root.id}:too-deep`);
+    expect(deepIssues).toEqual([
+      expect.objectContaining({
+        relativePath: 'Archive',
+        // The three files and the three folders holding them.
+        message: expect.stringContaining('6 items are inside folders nested more than 32 levels'),
+      }),
+    ]);
+    expect(engine.state.issues.filter((issue) => issue.relativePath?.includes('/'))).toEqual([]);
+    for (const name of ['one.txt', 'two.txt', 'three.txt'])
+      expect(
+        journal.pendingJob(root.id, `Archive/a/b/${name}`, 'upsert')?.payload.retryAt,
+      ).toBeGreaterThan(Date.now() + 23 * 3600_000);
+  } finally {
+    await engine.stop();
+    await close();
+  }
+});
+
+it('counts the files found while a folder is first checked, then clears the count', async () => {
+  const { local, journal, close } = await fixture();
+  const api = new ApiClient(async (endpoint) =>
+    endpoint.startsWith('/v1/sync/changes') ? { changes: [], nextCursor: 1, hasMore: false } : {},
+  );
+  const seen: (Record<string, { found: number }> | undefined)[] = [];
+  const engine = new SyncEngine(api, journal, 'device', (state) =>
+    seen.push((state as { checking?: Record<string, { found: number }> }).checking),
+  );
+  try {
+    for (let folder = 0; folder < 3; folder++) {
+      await mkdir(path.join(local, `f${folder}`));
+      for (let index = 0; index < 20; index++)
+        await writeFile(path.join(local, `f${folder}`, `${index}.txt`), 'x');
+    }
+    await engine.tick();
+    // Updates are throttled, so a quick check may show only its first count.
+    expect(seen.some((checking) => checking?.root !== undefined)).toBe(true);
+    expect(engine.state.checking?.root).toBeUndefined();
+    // The count the scan reports as it goes reaches every file.
+    let last = 0;
+    await (engine as any).scanLocalPass(journal.roots()[0], (found: number) => (last = found));
+    expect(last).toBe(60);
+  } finally {
+    await engine.stop();
+    await close();
+  }
+});
+
+it('resumes a backup run before looking through its folder again', async () => {
+  const { local, journal, close } = await fixture();
+  journal.root({
+    id: 'backup',
+    localPath: local,
+    remoteId: 'remote-backup',
+    backupId: 'b1',
+    mode: 'backup',
+    paused: false,
+    excluded: [],
+  });
+  journal.removeRoot('root');
+  // A run left from before the app restarted, with nothing left in it.
+  journal.set('backup-run:backup', { id: 'run', trigger: 'AUTOMATIC', total: 1, next: 1 });
+  journal.set('backup-run-jobs:backup', ['gone']);
+  const api = new ApiClient(async (endpoint) => {
+    if (endpoint.startsWith('/v1/sync/changes'))
+      return { changes: [], nextCursor: 1, hasMore: false };
+    if (endpoint === '/v1/backups/b1') return { root: { state: 'ACTIVE' } };
+    if (endpoint.endsWith('/pending-restores')) return { items: [] };
+    return {};
+  });
+  const engine = new SyncEngine(api, journal, 'device', () => {});
+  const scans = vi.spyOn(engine as any, 'scanLocal');
+  try {
+    await engine.tick();
+    expect(scans).not.toHaveBeenCalled();
+    expect(journal.get('backup-run:backup')).toBeNull();
+    // The run is done: the next pass looks through the folder.
+    await engine.tick();
+    expect(scans).toHaveBeenCalledTimes(1);
+  } finally {
+    await engine.stop();
+    await close();
+  }
+});
+
+it('does not mistake one missing file for a missing sync folder', () => {
+  const missing = Object.assign(new Error('gone'), { code: 'ENOENT' });
+  expect(syncIssueCode(missing)).toBe('FOLDER_MISSING');
+  expect(syncIssueCode(missing, true)).toBe('SYNC_ERROR');
+});
+
+it('names conflict copies after this computer', async () => {
+  const { local, journal, root, close } = await fixture();
+  try {
+    journal.set('deviceName', 'Study Mac.local');
+    await writeFile(path.join(local, 'notes.txt'), 'unsynced changes');
+    journal.putFile({
+      rootId: root.id,
+      relativePath: 'notes.txt',
+      itemId: 'file',
+      revision: 1,
+      hash: createHash('sha256').update('old content').digest('hex'),
+      type: 'FILE',
+    });
+    const engine = new SyncEngine(new ApiClient(async () => ({})), journal, 'device', () => {});
+    await engine.remoteItem(
+      root,
+      item({ id: 'file', name: 'notes.txt', deletedAt: new Date().toISOString() }),
+    );
+    const names = await readdir(local);
+    expect(names).toHaveLength(1);
+    expect(names[0]).toMatch(/^notes \(Conflict - Study Mac - [0-9a-f]{8}\)\.txt$/);
+  } finally {
+    await close();
+  }
+});
+
+it('keeps a remotely deleted folder under a visible name and reports it once', async () => {
+  const { local, journal, root, folder, close } = await fixture();
+  try {
+    await mkdir(path.join(local, 'plans', 'empty'), { recursive: true });
+    await writeFile(path.join(local, 'plans', 'draft.txt'), 'keep me');
+    await writeFile(path.join(local, 'plans', 'empty', '.DS_Store'), '');
+    for (const [relativePath, itemId] of [
+      ['plans', 'plans'],
+      ['plans/empty', 'empty'],
+    ])
+      journal.putFile({
+        rootId: root.id,
+        relativePath,
+        itemId,
+        revision: 1,
+        hash: null,
+        type: 'FOLDER',
+      });
+    const engine = new SyncEngine(new ApiClient(async () => ({})), journal, 'device', () => {});
+    const deleted = { type: 'FOLDER' as const, deletedAt: new Date().toISOString() };
+    // A folder holding nothing but file-manager metadata is simply removed.
+    await engine.remoteItem(root, item({ ...deleted, id: 'empty', name: 'empty' }));
+    expect(await readdir(path.join(local, 'plans'))).toEqual(['draft.txt']);
+    expect(engine.state.issues).toEqual([]);
+    await engine.remoteItem(root, item({ ...deleted, id: 'plans', name: 'plans' }));
+    const [kept] = await readdir(local);
+    expect(kept).toMatch(/^plans \(Recovered by harbor0 \d{4}-\d\d-\d\d \d\d\.\d\d\.\d\d\)$/);
+    expect(await readFile(path.join(local, kept, 'draft.txt'), 'utf8')).toBe('keep me');
+    // The kept copy must not be uploaded again as a new folder.
+    expect(internalPath(`${kept}/draft.txt`)).toBe(true);
+    expect(engine.state.issues).toEqual([
+      expect.objectContaining({
+        code: 'FOLDER_RECOVERED',
+        relativePath: 'plans',
+        conflictPath: kept,
+      }),
+    ]);
+    // Informational only: the folder itself is healthy.
+    expect(folderState(folder(), engine.state, [])).toBe('Up to date');
+    expect(globalSyncState([folder()], engine.state, [])).toBe('Up to date');
+    engine.dismissConflict(engine.state.issues[0].id);
+    expect(engine.state.issues).toEqual([]);
+  } finally {
+    await close();
+  }
+});
+
+it('shows files that are only on another device as waiting, not up to date', async () => {
+  const { journal, root, folder, close } = await fixture();
+  try {
+    const remote = item({
+      id: 'file',
+      name: 'video.mov',
+      cloudState: 'RELEASED',
+    } as Partial<DriveItem>);
+    const requests: string[] = [];
+    const api = new ApiClient(async (endpoint, init) => {
+      requests.push(`${init?.method ?? 'GET'} ${endpoint}`);
+      if (endpoint === '/v1/drive/items/file') return { item: remote };
+      if (endpoint === '/v1/drive/items/file/versions')
+        return { items: [{ id: 'version', contentHash: 'abc' }] };
+      return {};
+    });
+    const engine = new SyncEngine(api, journal, 'device', () => {});
+    await engine.remoteItem(root, remote);
+    expect(requests).toContain('POST /v1/sync/items/file/request-content');
+    const state = { ...engine.state, waiting: [{ rootId: root.id, relativePath: 'video.mov' }] };
+    expect(folderState(folder(), state, [])).toBe(WAITING);
+    expect(globalSyncState([folder()], state, [])).toBe(WAITING);
+    // The engine publishes the same list with its next state update.
+    let published: { waiting?: unknown } = {};
+    const observed = new SyncEngine(api, journal, 'device', (next) => {
+      published = next as { waiting?: unknown };
+    });
+    await observed.remoteItem(root, remote);
+    expect(published.waiting).toEqual([{ rootId: root.id, relativePath: 'video.mov' }]);
+    await observed.remoteItem(root, { ...remote, deletedAt: new Date().toISOString() });
+    observed.dismissConflict('none');
+    expect(published.waiting).toEqual([]);
+  } finally {
+    await close();
+  }
+});

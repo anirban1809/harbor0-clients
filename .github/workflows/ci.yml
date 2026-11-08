@@ -1,0 +1,100 @@
+name: Validate
+on: [push, pull_request]
+# The backend (anirban1809/harbor0-src) is private. With a BACKEND_REPO_TOKEN secret (a fine-grained
+# token with read access to its contents), the checks also verify this repository's contracts and
+# API types match it and run the backend integration tests; the integration job needs it.
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    env:
+      HAS_BACKEND: ${{ secrets.BACKEND_REPO_TOKEN != '' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        if: env.HAS_BACKEND == 'true'
+        with:
+          repository: anirban1809/harbor0-src
+          token: ${{ secrets.BACKEND_REPO_TOKEN }}
+          path: backend
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            backend/package-lock.json
+      - run: npm ci
+      - if: env.HAS_BACKEND == 'true'
+        run: npm ci --prefix backend && npm run backend:link
+      - if: env.HAS_BACKEND == 'true'
+        run: npm run sync:backend -- --check
+      - run: npm run lint
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run build -w @harbor/web
+      - run: npm run build:web-static
+      - run: npm run infra:synth
+      - run: npm run build -w @harbor/desktop
+  integration:
+    runs-on: ubuntu-latest
+    env:
+      HAS_BACKEND: ${{ secrets.BACKEND_REPO_TOKEN != '' }}
+    steps:
+      - uses: actions/checkout@v4
+        if: env.HAS_BACKEND == 'true'
+      - uses: actions/checkout@v4
+        if: env.HAS_BACKEND == 'true'
+        with:
+          repository: anirban1809/harbor0-src
+          token: ${{ secrets.BACKEND_REPO_TOKEN }}
+          path: backend
+      - uses: actions/setup-node@v4
+        if: env.HAS_BACKEND == 'true'
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            backend/package-lock.json
+      - if: env.HAS_BACKEND == 'true'
+        run: npm ci && npm ci --prefix backend && npm run backend:link
+      - if: env.HAS_BACKEND == 'true'
+        run: cp backend/.env.example backend/.env && cp apps/web/.env.example apps/web/.env.local
+      - if: env.HAS_BACKEND == 'true'
+        run: docker compose -f backend/compose.yaml up -d
+      - if: env.HAS_BACKEND == 'true'
+        run: |
+          ready=false
+          for i in $(seq 1 30); do
+            if npm run local:setup; then ready=true; break; fi
+            sleep 2
+          done
+          "$ready"
+      - if: env.HAS_BACKEND == 'true'
+        run: RUN_INTEGRATION=true npm test
+      - if: env.HAS_BACKEND == 'true'
+        run: npx playwright install --with-deps chromium
+      - if: env.HAS_BACKEND == 'true'
+        run: npm run dev:api > /tmp/harbor-api.log 2>&1 &
+      - if: env.HAS_BACKEND == 'true'
+        run: npm run dev:web > /tmp/harbor-web.log 2>&1 &
+      - if: env.HAS_BACKEND == 'true'
+        run: |
+          ready=false
+          for i in $(seq 1 30); do
+            if curl --fail http://127.0.0.1:8787/health && curl --fail http://localhost:3000; then
+              ready=true
+              break
+            fi
+            sleep 2
+          done
+          "$ready"
+      - if: env.HAS_BACKEND == 'true'
+        run: npx playwright test
+      - if: env.HAS_BACKEND == 'true'
+        run: npx tsx scripts/sync-integration.ts
+      - if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: failure-evidence
+          path: test-results/

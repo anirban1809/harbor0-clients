@@ -1,0 +1,56 @@
+name: Deploy production
+# Automatic: every push to main deploys the web app (app.harbor0.com) once the Validate workflow
+# has passed for that commit. A manual run from main redeploys its latest commit. The backend and
+# the landing and link sites deploy from anirban1809/harbor0-src, the console from
+# anirban1809/harbor0-admin.
+on:
+  workflow_run:
+    workflows: [Validate]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+# Deploys run in push order and never overlap; a newer commit waits for the one in flight.
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+permissions:
+  contents: read
+  id-token: write
+jobs:
+  deploy:
+    # The AWS role (infra/github.ts) only trusts main. Validate also runs for pull requests; only
+    # pushes deploy. Until PRODUCTION_AWS_ROLE_ARN is set the job is skipped rather than failing.
+    if: >-
+      vars.PRODUCTION_AWS_ROLE_ARN != '' &&
+      github.ref == 'refs/heads/main' &&
+      (github.event_name == 'workflow_dispatch' ||
+       (github.event.workflow_run.conclusion == 'success' &&
+        github.event.workflow_run.event == 'push'))
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Deploy exactly the commit Validate passed, not whatever main points at now.
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: npx playwright install --with-deps chromium
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.PRODUCTION_AWS_ROLE_ARN }}
+          aws-region: ${{ vars.PRODUCTION_AWS_REGION || 'us-east-1' }}
+      - name: Write .env.cloud
+        env:
+          AWS_REGION: ${{ vars.PRODUCTION_AWS_REGION || 'us-east-1' }}
+          WEB_ORIGIN: ${{ vars.PRODUCTION_WEB_ORIGIN }}
+          WEB_CERT_ARN: ${{ vars.PRODUCTION_WEB_CERT_ARN }}
+        run: |
+          umask 077
+          for name in AWS_REGION WEB_ORIGIN WEB_CERT_ARN; do
+            printf '%s=%s\n' "$name" "${!name}"
+          done > .env.cloud
+      # The API URL comes from the backend's live stack (HarborStorage).
+      - run: npm run cloud:deploy-web

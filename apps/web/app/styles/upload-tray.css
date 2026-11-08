@@ -1,0 +1,142 @@
+/* The floating upload card, used by the web app and by client rooms. */
+.upload-tray {
+  position: fixed;
+  right: 24px;
+  bottom: 24px;
+  z-index: 50;
+  display: flex;
+  flex-direction: column;
+  width: min(380px, calc(100vw - 32px));
+  max-height: min(480px, 60vh);
+  overflow: hidden;
+}
+.upload-head {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  padding: 10px 8px 10px 14px;
+}
+.upload-head-text {
+  display: grid;
+  flex: 1;
+  gap: 2px;
+  min-width: 0;
+}
+.upload-head-text strong {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: var(--text-sm);
+  font-weight: 600;
+}
+.upload-head-text small,
+.upload-body small {
+  overflow: hidden;
+  color: var(--text-2);
+  font-size: var(--text-xs);
+  font-variant-numeric: tabular-nums;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.upload-collapse svg {
+  transition: transform 150ms ease;
+}
+.upload-tray[data-collapsed='true'] .upload-collapse svg {
+  transform: rotate(180deg);
+}
+.upload-tray > .progress-track {
+  flex-shrink: 0;
+  height: 3px;
+  margin: 0 14px 10px;
+}
+.upload-list {
+  flex: 1;
+  min-height: 0;
+  margin: 0;
+  padding: 4px 0;
+  overflow-y: auto;
+  border-top: 1px solid var(--line);
+  list-style: none;
+}
+.upload-entry {
+  display: grid;
+  grid-template-columns: 32px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 8px 6px 14px;
+  font-size: var(--text-sm);
+}
+.upload-entry:hover {
+  background: var(--fill-1);
+}
+.upload-icon {
+  display: grid;
+  place-items: center;
+  width: 32px;
+  height: 32px;
+  border-radius: var(--radius);
+  background: var(--fill-2);
+  color: var(--text-2);
+}
+.upload-entry[data-phase='done'] .upload-icon {
+  color: var(--success-text);
+}
+.upload-entry[data-phase='failed'] .upload-icon {
+  color: var(--danger-text);
+}
+.upload-body {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+}
+.upload-body strong {
+  overflow: hidden;
+  font-weight: 500;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.upload-body .progress-track {
+  height: 3px;
+  margin-top: 2px;
+}
+.upload-conflict {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+}
+.upload-conflict [data-variant='link'] {
+  height: auto;
+  padding: 0;
+  font-size: 12px;
+}
+.upload-entry[data-phase='paused'] .progress-track > span {
+  background: var(--text-3);
+}
+.upload-entry[data-phase='queued'] .upload-body strong {
+  color: var(--text-2);
+}
+.upload-entry[data-phase='failed'] small {
+  color: var(--danger-text);
+}
+.upload-actions {
+  display: flex;
+  align-items: center;
+}
+.upload-done {
+  flex-shrink: 0;
+  color: var(--success-text);
+}
+.upload-actions > .upload-done {
+  margin: 0 8px;
+}
+.upload-failed-icon {
+  flex-shrink: 0;
+  color: var(--danger-text);
+}
+.upload-foot {
+  display: flex;
+  justify-content: flex-end;
+  gap: 4px;
+  padding: 6px 8px;
+  border-top: 1px solid var(--line);
+}

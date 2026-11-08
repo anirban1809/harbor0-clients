@@ -1,0 +1,3373 @@
+import path from 'node:path';
+import os from 'node:os';
+import {
+  FolderBackups,
+  backupReady,
+  modifiedAt,
+  type BackupConversion,
+  type BatchOutcome,
+} from './backups';
+import { SyncReceipts } from './sync-receipts';
+import { ActivityReporter, type ActivitySubject } from './activity';
+import {
+  GIVE_UP_AFTER,
+  gaveUp,
+  gaveUpMessage,
+  giveUp,
+  revive,
+  unchangedSinceGivingUp,
+} from './retry-policy';
+import { mkdir, lstat, rename, rm, access, readdir, readFile } from 'node:fs/promises';
+import { constants, type Stats } from 'node:fs';
+import {
+  FOLDER_UNAVAILABLE_CODES,
+  folderUnreadable,
+  fullBelow,
+  stickyIssue,
+  storageFullNow,
+  storageNeed,
+  syncIssueCode,
+  type SyncRuntime,
+  type SyncIssue,
+  type SyncActivityItem,
+  type RestoreProgress,
+  type RestoreSummary,
+} from './sync-state';
+import { watchTree, type TreeWatcher } from './local-watcher';
+import {
+  findVolume,
+  isNetwork,
+  volumeConnected,
+  volumeId,
+  volumeLabel,
+  volumeRoot,
+  type Volume,
+} from './volumes';
+import { ApiClient, ApiError } from '@harbor/api-client';
+import { createHash } from 'node:crypto';
+import { FileCipher, b64url, encryptedSize } from '../../../packages/api-client/src/e2ee';
+import { BATCH_UPLOAD_FILES, BATCH_UPLOAD_MAX_BYTES, type DriveItem } from '@harbor/contracts';
+import { Journal, type Root, type LocalJob, type LocalFile } from './journal';
+import {
+  contained,
+  internalPath,
+  metadataSegment,
+  recoveredName,
+  safeParents,
+  safeSegment,
+  legacySafeSegment,
+  conflictName,
+} from './paths';
+import {
+  uploadFile,
+  downloadFile,
+  hashFile,
+  cancelUpload,
+  putPart,
+  transferKeys,
+  FileChangedError,
+  type UploadState,
+} from './transfers';
+// Watchers can miss events (sleep, a full event buffer, edits while the app was closed),
+// so every folder is also compared against the journal on this schedule.
+export const LOCAL_SCAN_INTERVAL = 5 * 60_000;
+/**
+ * Jobs in queue order, except that folder deletions run after everything else, deepest first.
+ * A file inside a deleted folder may yet turn out to have moved (a renamed folder is reported as
+ * a deletion and an addition, in any order); deleting the folder in the cloud first would delete
+ * the file with it.
+ */
+// A pass waiting this long on one server request is aborted and started again.
+export const STALL_TIMEOUT = 3 * 60_000;
+// How often a folder whose drive is away looks for it mounted somewhere else.
+export const VOLUME_SEARCH_INTERVAL = 10_000;
+// A network share that takes longer than this to answer is treated as unavailable.
+export const NETWORK_TIMEOUT = 15_000;
+// Network shares are rescanned less often: every look is a round trip, and their own changes
+// made from other computers are not reported by the OS anyway.
+export const NETWORK_SCAN_INTERVAL = 30 * 60_000;
+// Files looked up at once while scanning, which matters most on high-latency shares.
+const SCAN_BATCH = 16;
+// While both have work, a backup run and the sync queue each run this long before the other gets a
+// turn; otherwise whichever started first would take the whole request allowance.
+const BACKUP_YIELD_MS = 15_000;
+const SYNC_SLICE_MS = 15_000;
+// Jobs read from the queue at a time.
+const QUEUE_PAGE = 500;
+/** One file of a backup batch, ready to go: its folder exists and its content is hashed. */
+type BatchFile = {
+  job: LocalJob;
+  absolute: string;
+  info: Stats;
+  hash: string;
+  parentId: string | null;
+  operationId: string;
+  // Set on an encrypted account: the file's own key, with its header.
+  cipher?: FileCipher;
+  // A synced file that is already in the cloud: its new version.
+  known?: { itemId: string; revision: number };
+};
+/** Where a batch goes: a backup run's routes, or a synced folder's. */
+type BatchRoutes = { create: string; finish: string; backup: boolean };
+/** A local file ready to upload; see SyncEngine.uploadPlan. */
+type UploadPlan = {
+  absolute: string;
+  info: Stats;
+  hash: string;
+  parentId: string | null;
+  known: LocalFile | undefined;
+  state: UploadState;
+  backup?: { rootId: string; runId: string; sourceName?: string };
+  /** The name it is stored under, when its own name was taken (see caseAlias). */
+  cloudName?: string;
+  verifyBackupQuiet: () => Promise<void>;
+};
+// Files of a backup batch sent to storage at once.
+const BATCH_PUT_CONCURRENCY = 8;
+/**
+ * The name a backed up file or folder is stored under when another one here has the same name
+ * in other capitals (IMG_1.MOV beside IMG_1.mov, as a case-sensitive drive can hold): harbor0
+ * keeps names unique regardless of case, as Macs and PCs do.
+ */
+export function caseAlias(name: string, attempt = 1) {
+  const dot = name.lastIndexOf('.');
+  const [stem, ext] = dot > 0 ? [name.slice(0, dot), name.slice(dot)] : [name, ''];
+  return `${stem} (Case Conflict${attempt > 1 ? ` ${attempt}` : ''})${ext}`;
+}
+// A path harbor0 never accepts (nested too deep) is retried this rarely.
+const REFUSED_PATH_RETRY_MS = 24 * 3600_000;
+// Unreadable subfolders listed as separate problems; the last one counts the rest.
+const UNREADABLE_SHOWN = 10;
+// Failed files and folders retry with growing delays (4s up to 5 minutes).
+const retryDelay = (attempts: number) => Math.min(300_000, 2000 * 2 ** Math.min(attempts, 10));
+// Remote checks start every 2s and back off to 30s while nothing changes;
+// local edits, remote changes and wake() return to the fast rate.
+export const REMOTE_POLL_MIN = 2000;
+export const REMOTE_POLL_MAX = 30_000;
+// With live updates connected, polling is only a safety net for missed messages.
+export const REMOTE_POLL_LIVE = 5 * 60_000;
+async function localStat(file: string) {
+  try {
+    const info = await lstat(file);
+    return { sizeBytes: info.size, mtimeMs: info.mtimeMs };
+  } catch {
+    return {};
+  }
+}
+/** How often a pass that only reports progress also checks for activity to report. */
+const ACTIVITY_CHECK_MS = 2_000;
+export class SyncEngine {
+  private receipts: SyncReceipts;
+  private backups: FolderBackups;
+  private reporter: ActivityReporter;
+  private lastActivityCheck = 0;
+  private watchers = new Map<string, TreeWatcher>();
+  // When each folder whose drive is away may next look for that drive at another mount point.
+  private nextVolumeSearch = new Map<string, number>();
+  // Folders on network shares, by root id, with the share they are on.
+  private shares = new Map<string, string>();
+  // Shares with a request still stuck after timing out: nothing more is sent until it returns.
+  private stalledShares = new Set<string>();
+  private scannedAt = new Map<string, number>();
+  // By root: subfolders the last scan could not read, until a scan reads them.
+  private unreadable = new Map<string, string[]>();
+  // By root: queued files refused for being nested too deep; see tooDeep.
+  private deepJobs = new Map<string, Set<string>>();
+  private api: ApiClient;
+  private tickController = new AbortController();
+  // Start times of the server requests still waiting for an answer.
+  private inflight = new Set<{ at: number }>();
+  private watchdog?: ReturnType<typeof setInterval>;
+  private timer?: ReturnType<typeof setInterval>;
+  private wakeTimer?: ReturnType<typeof setTimeout>;
+  private queueEmitTimer?: ReturnType<typeof setTimeout>;
+  // Folders, by root id, to check for synced items that disappeared without being reported.
+  private siblingChecks = new Map<string, Set<string>>();
+  private siblingTimer?: ReturnType<typeof setTimeout>;
+  // The sibling check under way, which stopping waits for before the journal can close.
+  private siblingWork = Promise.resolve();
+  private pendingWake = false;
+  private lastProgressEmit = 0;
+  private running = false;
+  private stopped = false;
+  private work?: Promise<void>;
+  private mutation = Promise.resolve();
+  private currentRootId = '';
+  // While the feed is read: items looked up so far, so each folder above a change is fetched
+  // once rather than once per change and synced folder.
+  private feedItems?: Map<string, DriveItem>;
+  private publishedFolders = '';
+  private publishingFolders = false;
+  private publishWork?: Promise<void>;
+  private publishRetryAt = 0;
+  private publishedAt = 0;
+  private removedRemoteIds = new Set<string>();
+  private confirmationWork?: Promise<void>;
+  private confirmationController = new AbortController();
+  private nextConfirmationAt = 0;
+  private rootRetry = new Map<string, { attempts: number; at: number }>();
+  private waiting = new Map<string, { rootId: string; relativePath: string }>();
+  private remoteDelay = REMOTE_POLL_MIN;
+  private maxDelay = REMOTE_POLL_MAX;
+  private nextRemoteAt = 0;
+  private checkpointed?: number;
+  private hurried = false;
+  // While the server is unreachable or failing, passes wait out a growing delay instead of
+  // starting every 2s; wake() and tick() try again at once.
+  private outages = 0;
+  // Off once the server turns out to have no batch upload routes; see syncBatch.
+  private syncBatches = true;
+  // A restore asked for from this computer; a long catch-up on the feed stops for it.
+  private restoreRequested = false;
+  private outageUntil = 0;
+  // Files finished per sync folder since it was last idle; the base for its percent complete.
+  private syncDone = new Map<string, number>();
+  // Folders this computer is removing itself; nothing to tell the user when they go.
+  private leaving = new Set<string>();
+  state: SyncRuntime = {
+    running: false,
+    paused: false,
+    online: true,
+    message: 'Ready',
+    queued: 0,
+    lastSync: null,
+    active: null,
+    issues: [],
+    recent: [],
+  };
+  constructor(
+    api: ApiClient,
+    private journal: Journal,
+    private deviceId: string,
+    private changed: (state: unknown) => void,
+    // A desktop notification for something the user did not do on this computer.
+    private notify: (title: string, body: string) => void = () => {},
+  ) {
+    // Every request of a pass shares its signal, so the watchdog can end a pass that hangs.
+    this.api = new ApiClient(async (endpoint, init = {}) => {
+      const request = { at: Date.now() };
+      this.inflight.add(request);
+      try {
+        return await api.request(endpoint, {
+          ...init,
+          signal: init.signal
+            ? AbortSignal.any([init.signal, this.tickController.signal])
+            : this.tickController.signal,
+        });
+      } finally {
+        this.inflight.delete(request);
+      }
+    });
+    this.receipts = new SyncReceipts(api, journal);
+    // Not bound to a pass: a report must not end with a pass the watchdog cut short.
+    this.reporter = new ActivityReporter(api, journal);
+    this.backups = new FolderBackups(
+      this.api,
+      journal,
+      (root, work) => this.onShare(root, work),
+      (rootId) => this.unreadable.get(rootId) ?? [],
+    );
+    this.backups.batch = (root, jobs, runId) => this.backupBatch(root, jobs, runId);
+    this.backups.onStorageFull = (need) => this.storageIsFull(need);
+    this.backups.onRestore = (rootId, progress, summary) =>
+      this.setRestoring(rootId, progress, summary);
+    this.state.lastSync = journal.get<string>('lastSync') ?? null;
+    // An ended session returns the app to sign-in by itself; never restore that as a sync problem.
+    this.state.issues = (journal.get<SyncIssue[]>('syncIssues') ?? []).filter(
+      (issue) => issue.code !== 'AUTH_INVALID',
+    );
+    this.state.recent = journal.get<SyncActivityItem[]>('syncRecent') ?? [];
+  }
+  async start() {
+    this.stopped = false;
+    this.reporter.start();
+    this.confirmationController = new AbortController();
+    this.nextConfirmationAt = 0;
+    this.remoteDelay = REMOTE_POLL_MIN;
+    this.nextRemoteAt = 0;
+    for (let root of this.journal.roots()) {
+      if (root.mode === 'sync' && !root.remoteId) {
+        root = { ...root, paused: true };
+        this.journal.root(root);
+        this.state.issues = this.state.issues.filter(
+          (issue) => issue.rootId !== root.id || stickyIssue(issue),
+        );
+        this.state.issues.push({
+          id: `${root.id}:mapping`,
+          rootId: root.id,
+          code: 'MAPPING_REQUIRED',
+          message: 'Choose a cloud folder for this local folder before syncing resumes.',
+          at: new Date().toISOString(),
+        });
+        this.persistIssues();
+      }
+      if (root.mode === 'sync') this.journal.root({ ...root, needsReconcile: true });
+      // An archived folder has no local copy to watch until it is restored.
+      if (root.archive === 'archived' || root.archive === 'restoring') continue;
+      const checked = await this.checkRoot(root);
+      if (checked) await this.watch(checked);
+    }
+    this.timer = setInterval(() => void this.run(), REMOTE_POLL_MIN);
+    this.watchdog = setInterval(() => this.checkStalled(), 15_000);
+    void this.tick();
+  }
+  /** A pass stuck on the server for STALL_TIMEOUT is aborted; the next one starts fresh. */
+  private checkStalled() {
+    const oldest = Math.min(...[...this.inflight].map((request) => request.at));
+    if (!this.running || Date.now() - oldest < STALL_TIMEOUT) return;
+    this.inflight.clear();
+    this.tickController.abort(
+      Object.assign(new Error('Sync stopped responding and was restarted.'), {
+        name: 'TimeoutError',
+      }),
+    );
+  }
+  async stop() {
+    this.stopped = true;
+    this.reporter.stop();
+    this.confirmationController.abort();
+    await this.confirmationWork;
+    this.pendingWake = false;
+    if (this.wakeTimer) clearTimeout(this.wakeTimer);
+    this.wakeTimer = undefined;
+    if (this.queueEmitTimer) clearTimeout(this.queueEmitTimer);
+    this.queueEmitTimer = undefined;
+    if (this.siblingTimer) clearTimeout(this.siblingTimer);
+    this.siblingTimer = undefined;
+    this.siblingChecks.clear();
+    if (this.timer) clearInterval(this.timer);
+    if (this.watchdog) clearInterval(this.watchdog);
+    await Promise.all([...this.watchers.values()].map((w) => w.close()));
+    this.watchers.clear();
+    this.scannedAt.clear();
+    await this.work;
+    await this.publishWork;
+    await this.siblingWork.catch(() => {});
+  }
+  private ignored(root: Root, relative: string) {
+    return (
+      internalPath(relative) ||
+      root.excluded.some((p) => relative === p || relative.startsWith(p + '/'))
+    );
+  }
+  private relativeTo(root: Root, full: string) {
+    return path.relative(root.localPath, full).split(path.sep).join('/');
+  }
+  async watch(root: Root) {
+    const watcher = watchTree(root.localPath, (full) =>
+      this.ignored(root, this.relativeTo(root, full)),
+    );
+    const queue =
+      (kind: 'upsert' | 'delete', changed = false) =>
+      (full: string, info?: Stats) => {
+        const relative = this.relativeTo(root, full);
+        if (kind === 'upsert' && !this.journal.file(root.id, relative))
+          this.checkSiblings(root.id, path.posix.dirname(relative));
+        if (this.observe(root.id, relative, kind, info, 'watch', changed)) this.changesFound();
+      };
+    watcher
+      .on('add', queue('upsert'))
+      .on('addDir', queue('upsert'))
+      .on('change', queue('upsert', true))
+      .on('unlink', queue('delete'))
+      .on('error', (error) => {
+        this.issue(root.id, error);
+        // The next pass watches again and rescans whatever was missed meanwhile.
+        void watcher.close();
+        if (this.watchers.get(root.id) === watcher) {
+          this.watchers.delete(root.id);
+          this.scannedAt.delete(root.id);
+        }
+        this.scheduleTick();
+      });
+    this.watchers.set(root.id, watcher);
+  }
+  /**
+   * A new item may be a synced one renamed or moved, and the OS does not always report the old
+   * path: the synced items beside it are checked, so the rename is seen as a move rather than as
+   * a new copy and a folder left behind until the next full scan. Batched, one listing a folder.
+   */
+  private checkSiblings(rootId: string, folder: string) {
+    const folders = this.siblingChecks.get(rootId) ?? new Set<string>();
+    folders.add(folder);
+    this.siblingChecks.set(rootId, folders);
+    this.siblingTimer ??= setTimeout(() => {
+      this.siblingWork = this.findVanished();
+    }, 100);
+  }
+  private async findVanished() {
+    this.siblingTimer = undefined;
+    const checks = [...this.siblingChecks];
+    this.siblingChecks.clear();
+    let found = false;
+    for (const [rootId, folders] of checks) {
+      const root = this.journal.roots().find((item) => item.id === rootId);
+      if (!root || this.stopped) continue;
+      for (const folder of folders) {
+        let listed: string[];
+        try {
+          listed = await readdir(
+            folder === '.' ? root.localPath : contained(root.localPath, folder),
+          );
+        } catch {
+          continue; // Gone or unreadable itself: its own report or the next scan covers it.
+        }
+        if (this.stopped) return;
+        for (const file of this.journal.children(rootId, folder === '.' ? '' : folder))
+          if (
+            !listed.includes(path.posix.basename(file.relativePath)) &&
+            this.observe(rootId, file.relativePath, 'delete', undefined, 'watch')
+          )
+            found = true;
+      }
+    }
+    if (found) this.changesFound();
+  }
+  private changesFound() {
+    // Batch large scans while still showing new files promptly, including when paused.
+    if (!this.queueEmitTimer)
+      this.queueEmitTimer = setTimeout(() => {
+        this.queueEmitTimer = undefined;
+        this.emit();
+      }, 50);
+    this.hurry();
+    this.scheduleTick();
+  }
+  /**
+   * Record one local change in the journal unless the journal already matches the disk.
+   * Returns whether anything was queued.
+   */
+  private observe(
+    rootId: string,
+    relative: string,
+    kind: 'upsert' | 'delete',
+    info: Stats | undefined,
+    source: string,
+    changed = false,
+  ) {
+    const root = this.journal.roots().find((entry) => entry.id === rootId);
+    if (!root || !relative || relative.startsWith('..') || this.ignored(root, relative))
+      return false;
+    const known = this.journal.file(root.id, relative);
+    const queued = this.journal.pendingJob(root.id, relative, kind);
+    const pending = !!queued;
+    if (kind === 'upsert' && info && !pending && known) {
+      if (info.isDirectory() && known.type === 'FOLDER') return false;
+      if (
+        info.isFile() &&
+        known.type === 'FILE' &&
+        known.sizeBytes === info.size &&
+        known.mtimeMs === info.mtimeMs
+      )
+        return false;
+    }
+    if (kind === 'delete') {
+      // Backups keep what was saved; nothing to do for a file the cloud never had.
+      if (root.mode === 'backup' || (!known && !pending)) return false;
+      if (known?.type === 'FOLDER')
+        for (const child of this.journal.files(root.id))
+          if (child.relativePath.startsWith(relative + '/'))
+            this.journal.enqueue(root.id, child.relativePath, 'delete', undefined, source);
+    }
+    this.journal.enqueue(
+      root.id,
+      relative,
+      kind,
+      info
+        ? {
+            type: info.isDirectory() ? 'FOLDER' : 'FILE',
+            sizeBytes: info.size,
+            updatedAt: info.mtime.toISOString(),
+          }
+        : undefined,
+      source,
+    );
+    // A queued file restarts its wait only when its size or time moved. Windows also reports a
+    // file being read, as harbor0 does when checking it, which would put it off for ever.
+    const entry = queued?.payload.entry as { sizeBytes?: number; updatedAt?: string } | undefined;
+    const moved =
+      !info ||
+      !entry ||
+      entry.sizeBytes !== info.size ||
+      entry.updatedAt !== info.mtime.toISOString();
+    if (root.mode === 'backup' && changed && moved) {
+      const job = this.journal.pendingJob(root.id, relative, kind);
+      if (job) {
+        job.payload.observedAt = Date.now();
+        this.journal.saveJob(job);
+      }
+    }
+    return true;
+  }
+  /** Compare the whole folder with the journal: catches anything the watcher missed. */
+  private async scanLocal(root: Root) {
+    // A folder's first look this session can take minutes: count the files found as it goes.
+    if (this.scannedAt.has(root.id)) return this.scanLocalPass(root);
+    if (!this.journal.pendingCount(root.id))
+      this.state.message = `Checking ${path.basename(root.localPath)}…`;
+    this.setChecking(root.id, { found: 0 });
+    try {
+      await this.scanLocalPass(root, (found) => this.setChecking(root.id, { found }));
+    } finally {
+      this.setChecking(root.id, undefined);
+    }
+  }
+  /** A folder's progress while it is looked through; see SyncRuntime.checking. */
+  private setChecking(rootId: string, progress: { found: number; checked?: number } | undefined) {
+    const { [rootId]: _, ...rest } = this.state.checking ?? {};
+    this.state.checking = progress ? { ...rest, [rootId]: progress } : rest;
+    // Progress-only updates are throttled; the last one always goes out.
+    this.emit(!!progress);
+  }
+  /** A restore under way in a backup folder, and how it went once done; see SyncRuntime. */
+  private setRestoring(rootId: string, progress?: RestoreProgress, summary?: RestoreSummary) {
+    const { [rootId]: _, ...rest } = this.state.restoring ?? {};
+    this.state.restoring = progress ? { ...rest, [rootId]: progress } : rest;
+    if (summary) this.state.restored = { ...this.state.restored, [rootId]: summary };
+    this.emit(!!progress && progress.loaded > 0);
+  }
+  /** A restore was just requested from this computer: start it without waiting. */
+  restoreSoon() {
+    this.backups.restoreSoon();
+    this.restoreRequested = true;
+    this.wake();
+  }
+  private async scanLocalPass(root: Root, report?: (found: number) => void) {
+    let files = 0;
+    const seen = new Set<string>();
+    // Subfolders harbor0 may not read: skipped, and what was synced from them is not deleted.
+    const unreadable: string[] = [];
+    let found = false;
+    const walk = async (relative: string) => {
+      let entries;
+      try {
+        const directory = relative ? contained(root.localPath, relative) : root.localPath;
+        entries = await this.onShare(root, () => readdir(directory, { withFileTypes: true }));
+      } catch (error) {
+        const code = (error as NodeJS.ErrnoException).code;
+        if (code === 'ENOENT') return;
+        if (relative && (code === 'EACCES' || code === 'EPERM')) {
+          unreadable.push(relative);
+          return;
+        }
+        throw error;
+      }
+      const names = entries
+        .filter((entry) => !entry.isSymbolicLink() && (entry.isDirectory() || entry.isFile()))
+        .map((entry) => (relative ? `${relative}/${entry.name}` : entry.name))
+        .filter((name) => !this.ignored(root, name));
+      for (let start = 0; start < names.length; start += SCAN_BATCH) {
+        if (this.stopped || this.state.paused) return;
+        const batch = names.slice(start, start + SCAN_BATCH);
+        const infos = await Promise.all(
+          batch.map((name) =>
+            this.onShare(root, () => lstat(contained(root.localPath, name))).catch(
+              (error: NodeJS.ErrnoException) => {
+                // A share that stopped answering ends the scan; one vanished file does not.
+                if (error.code === 'SHARE_UNAVAILABLE') throw error;
+                return null;
+              },
+            ),
+          ),
+        );
+        const folders: string[] = [];
+        this.journal.transaction(() => {
+          for (const [index, name] of batch.entries()) {
+            const info: Stats | null = infos[index];
+            if (!info) continue;
+            if (info.isFile()) files++;
+            seen.add(name);
+            if (this.observe(root.id, name, 'upsert', info, 'scan')) found = true;
+            if (info.isDirectory()) folders.push(name);
+          }
+        });
+        report?.(files);
+        for (const name of folders) await walk(name);
+      }
+    };
+    await walk('');
+    if (this.stopped || this.state.paused) return;
+    // The folder itself was checked this pass, so a missing entry was really removed.
+    const hidden = (relative: string) =>
+      unreadable.some((folder) => relative === folder || relative.startsWith(folder + '/'));
+    this.journal.transaction(() => {
+      for (const file of this.journal.files(root.id))
+        if (
+          !seen.has(file.relativePath) &&
+          !hidden(file.relativePath) &&
+          this.observe(root.id, file.relativePath, 'delete', undefined, 'scan')
+        )
+          found = true;
+    });
+    if (unreadable.length) this.unreadable.set(root.id, unreadable);
+    else this.unreadable.delete(root.id);
+    this.state.unreadable = Object.fromEntries(this.unreadable);
+    this.scannedAt.set(root.id, Date.now());
+    if (found) this.emit();
+  }
+  // The next tick checks the server instead of waiting out the idle backoff.
+  private hurry() {
+    this.hurried = true;
+    this.remoteDelay = REMOTE_POLL_MIN;
+    this.nextRemoteAt = 0;
+    this.receipts.nudge();
+  }
+  /** Live updates push changes, so idle checks can wait longer while connected. */
+  setLive(connected: boolean) {
+    this.maxDelay = connected ? REMOTE_POLL_LIVE : REMOTE_POLL_MAX;
+    if (!connected) {
+      this.remoteDelay = Math.min(this.remoteDelay, REMOTE_POLL_MAX);
+      this.nextRemoteAt = Math.min(this.nextRemoteAt, Date.now() + REMOTE_POLL_MAX);
+    }
+  }
+  /** Check the server now, e.g. when the window gains focus or the computer wakes. */
+  wake() {
+    this.outageUntil = 0;
+    this.hurry();
+    this.scheduleTick();
+  }
+  private scheduleTick() {
+    if (this.stopped || this.state.paused) return;
+    if (this.running) {
+      this.pendingWake = true;
+      return;
+    }
+    if (this.wakeTimer) return;
+    this.wakeTimer = setTimeout(() => {
+      this.wakeTimer = undefined;
+      void this.run();
+    }, 150);
+  }
+  pause(paused: boolean) {
+    this.state.paused = paused;
+    this.journal.set('paused', paused);
+    if (!paused) {
+      for (const root of this.journal.roots())
+        if (root.mode === 'sync') this.journal.root({ ...root, needsReconcile: true });
+      // Resuming is also the user's way to retry failed work now.
+      this.rootRetry.clear();
+      this.scannedAt.clear();
+      this.hurry();
+      for (const job of this.journal.jobs())
+        if (job.payload.retryAt || job.payload.retryAfter || gaveUp(job)) {
+          revive(job);
+          this.journal.saveJob(job);
+        }
+    }
+    this.emit();
+  }
+  private emit(progressOnly = false) {
+    const now = Date.now();
+    if (progressOnly && now - this.lastProgressEmit < 100) return;
+    this.lastProgressEmit = now;
+    this.state.queued = this.journal.jobCount();
+    this.state.waiting = [...this.waiting.values()];
+    // Counted once for both the progress and the activity report.
+    const queued = this.journal.jobCounts();
+    this.state.progress = this.progress(queued);
+    this.state.backupRuns = Object.fromEntries(
+      this.journal
+        .roots()
+        .filter((root) => root.mode === 'backup')
+        .flatMap((root) => {
+          const run = this.backups.run(root.id);
+          return run?.total ? [[root.id, run]] : [];
+        }),
+    );
+    // A backup run can take hours in one pass, emitting only progress: look again every so often.
+    if (!progressOnly || now - this.lastActivityCheck >= ACTIVITY_CHECK_MS) {
+      this.lastActivityCheck = now;
+      this.reporter.observe(this.activitySubjects(queued));
+    }
+    this.changed({ ...this.state });
+  }
+  /**
+   * What the engine and each folder is doing, for the server (see ActivityReporter): paused by
+   * the person or by the app, unable to run, moving files, or idle.
+   */
+  private activitySubjects(queued: Map<string, number>): ActivitySubject[] {
+    const held = this.hold?.();
+    const subjects: ActivitySubject[] = [
+      this.state.paused
+        ? { scope: 'ENGINE', status: 'PAUSED', reason: 'USER' }
+        : held
+          ? { scope: 'ENGINE', status: 'BLOCKED', reason: 'LOCKED' }
+          : storageFullNow(this.state)
+            ? { scope: 'ENGINE', status: 'BLOCKED', reason: 'STORAGE_FULL' }
+            : { scope: 'ENGINE', status: 'ACTIVE' },
+    ];
+    for (const root of this.journal.roots()) {
+      const folderId = root.mode === 'backup' ? root.backupId : (root.remoteId ?? undefined);
+      if (!folderId || root.archive) continue;
+      const scope = root.mode === 'backup' ? 'BACKUP' : 'SYNC';
+      const unavailable = this.state.issues.some(
+        (i) =>
+          i.rootId === root.id && !i.jobId && !i.scope && FOLDER_UNAVAILABLE_CODES.includes(i.code),
+      );
+      if (this.state.paused || root.paused) {
+        const byApp = this.state.issues.some((i) => i.id === `${root.id}:mapping`);
+        subjects.push({
+          scope,
+          folderId,
+          status: 'PAUSED',
+          reason: this.state.paused ? 'ALL' : byApp ? 'APP' : 'USER',
+        });
+      } else if (unavailable) {
+        subjects.push({ scope, folderId, status: 'BLOCKED', reason: 'UNAVAILABLE' });
+      } else if (root.mode === 'backup') {
+        const run = this.backups.openRun(root.id);
+        subjects.push(
+          run
+            ? {
+                scope,
+                folderId,
+                status: 'ACTIVE',
+                runId: run.id,
+                ...(run.total !== undefined ? { files: run.total } : {}),
+                ...(run.bytes !== undefined ? { bytes: run.bytes } : {}),
+              }
+            : { scope, folderId, status: 'IDLE' },
+        );
+      } else {
+        const waiting = queued.get(root.id) ?? 0;
+        const busy = waiting > 0 || this.state.active?.rootId === root.id;
+        const failed = this.state.issues.filter((i) => i.rootId === root.id && i.jobId).length;
+        subjects.push(
+          busy
+            ? { scope, folderId, status: 'ACTIVE', files: waiting }
+            : { scope, folderId, status: 'IDLE', failed },
+        );
+      }
+    }
+    return subjects;
+  }
+  /**
+   * Sync: files finished since the folder was last idle against those still queued, plus a
+   * download in flight. Backup: files saved in the current run against the run's size. The file
+   * being transferred counts by its bytes. Stays below 100 until the work is done.
+   */
+  private progress(queued: Map<string, number>) {
+    const progress: Record<string, number> = {};
+    const active = this.state.active;
+    for (const root of this.journal.roots()) {
+      const fraction =
+        active?.rootId === root.id && active.total > 0
+          ? Math.min(1, active.loaded / active.total)
+          : 0;
+      let done: number;
+      let total: number;
+      if (root.mode === 'backup') {
+        const run = this.backups.run(root.id);
+        if (!run?.total) continue;
+        ({ done, total } = run);
+      } else {
+        const download = active?.rootId === root.id && active.direction === 'download' ? 1 : 0;
+        const remaining = (queued.get(root.id) ?? 0) + download;
+        if (!remaining) continue;
+        done = this.syncDone.get(root.id) ?? 0;
+        total = done + remaining;
+      }
+      progress[root.id] = Math.min(99, Math.floor(((done + fraction) / total) * 100));
+    }
+    return progress;
+  }
+  private finished(rootId: string) {
+    this.syncDone.set(rootId, (this.syncDone.get(rootId) ?? 0) + 1);
+    const remoteId = this.journal.roots().find((r) => r.id === rootId)?.remoteId;
+    if (remoteId) this.reporter.fileMoved(remoteId);
+  }
+  validateRoot(root: Root) {
+    if (root.mode === 'sync' && !root.remoteId)
+      throw new Error('Choose a cloud folder before syncing.');
+    for (const other of this.journal.roots().filter((other) => other.id !== root.id)) {
+      const rel = path.relative(other.localPath, root.localPath);
+      const reverse = path.relative(root.localPath, other.localPath);
+      if (
+        !rel ||
+        (!rel.startsWith('..') && !path.isAbsolute(rel)) ||
+        (!reverse.startsWith('..') && !path.isAbsolute(reverse))
+      )
+        throw new Error('Sync and backup folders must not overlap.');
+      if (root.mode === 'sync' && other.mode === 'sync' && root.remoteId === other.remoteId)
+        throw new Error('This cloud folder is already synchronized on this computer.');
+    }
+  }
+  private changeConfiguration(change: () => void) {
+    const task = this.mutation.then(async () => {
+      // End the current pass now rather than waiting minutes for it: an unfinished transfer
+      // resumes from the journal after the restart, and no files are deleted.
+      this.tickController.abort(
+        Object.assign(new Error('Sync restarted to apply new settings.'), { name: 'AbortError' }),
+      );
+      await this.stop();
+      await this.work;
+      try {
+        change();
+      } finally {
+        await this.start();
+      }
+    });
+    this.mutation = task.catch(() => {});
+    return task;
+  }
+  async disconnectBackup(id: string) {
+    const root = this.journal.roots().find((r) => r.id === id && r.mode === 'backup');
+    if (!root) throw new Error('Backup folder was not found on this computer.');
+    const roots = (await this.api.request('/v1/backups')).items;
+    const backup = roots.find(
+      (entry: { remoteRootDriveItemId: string }) => entry.remoteRootDriveItemId === root.remoteId,
+    );
+    if (!backup) throw new Error('Backup connection was not found.');
+    this.leaving.add(root.id);
+    try {
+      await this.api.request(`/v1/backups/${backup.id}`, { method: 'DELETE' });
+      await this.removeRoot(root.id);
+    } finally {
+      this.leaving.delete(root.id);
+    }
+  }
+  /** Archive: one last full backup, then the local copy is removed and only the cloud copy stays. */
+  async archiveBackup(id: string, archived: boolean) {
+    const root = this.journal.roots().find((r) => r.id === id && r.mode === 'backup');
+    if (!root) throw new Error('Backup folder was not found on this computer.');
+    if (this.state.paused || root.paused)
+      throw new Error(`Resume backups before ${archived ? 'archiving' : 'restoring'} this folder.`);
+    if (archived) {
+      if (root.archive) throw new Error('This folder is already archived.');
+      this.journal.root({ ...root, archive: 'pending', archiveError: undefined });
+      this.journal.set(`backup-now:${root.id}`, true);
+    } else {
+      if (root.archive !== 'archived') throw new Error('This folder is not archived.');
+      this.validateRoot(root);
+      this.journal.root({ ...root, archive: 'restoring' });
+    }
+    this.emit();
+    this.wake();
+    return { queued: true };
+  }
+  async backupNow(id: string) {
+    const root = this.journal.roots().find((r) => r.id === id && r.mode === 'backup');
+    if (!root) throw new Error('Backup folder was not found on this computer.');
+    if (this.state.paused) throw new Error('Resume backups before backing up now.');
+    if (root.archive) throw new Error('Restore this archived folder before backing up.');
+    const checked = await this.checkRoot(root);
+    if (!checked) {
+      this.persistIssues();
+      this.emit();
+      const issue = this.state.issues.find((item) => item.rootId === id && !item.jobId);
+      throw new Error(issue?.message ?? 'This folder is unavailable.');
+    }
+    // Storage is full and files are already waiting for it: say so at once rather than looking
+    // through the whole folder, which takes minutes on a network share, to find the same.
+    const waiting = checked.backupStorage;
+    if (waiting && this.journal.pendingCount(root.id)) {
+      const storage = (await this.api.me().catch(() => null))?.storage;
+      if (storage && storage.availableBytes < fullBelow(storage.quotaBytes)) {
+        this.backups.storageShort(checked, { ...waiting, availableBytes: storage.availableBytes });
+        return { queued: false, changes: this.journal.pendingCount(root.id), storage: true };
+      }
+    }
+    const changes = await this.backups.request(checked);
+    if (changes) {
+      // Saying "Backing up" and failing a moment later helps no one: check there is room first.
+      // Offline, the run simply waits for the connection as before.
+      const available = (await this.api.me().catch(() => null))?.storage.availableBytes;
+      let smallest = Infinity;
+      let required = 0;
+      let files = 0;
+      for (const job of available === undefined ? [] : this.journal.jobs())
+        if (job.rootId === root.id && job.kind === 'upsert') {
+          const info = await lstat(contained(root.localPath, job.relativePath)).catch(() => null);
+          if (!info?.isFile()) continue;
+          smallest = Math.min(smallest, info.size);
+          required += info.size;
+          files++;
+        }
+      if (smallest !== Infinity && smallest > available!) {
+        this.journal.set(`backup-now:${root.id}`, false);
+        // Shown on the folder's panel, and as the account being full, until space is freed.
+        this.backups.storageShort(root, {
+          requiredBytes: required,
+          availableBytes: available!,
+          files,
+        });
+        // Nothing to start: the folder's panel says why, so this isn't an error as well.
+        return { queued: false, changes, storage: true };
+      }
+      this.wake();
+    }
+    return { queued: changes > 0, changes };
+  }
+  async addRoot(root: Root) {
+    this.validateRoot(root);
+    await this.changeConfiguration(() => {
+      this.validateRoot(root);
+      this.journal.root({ ...root, needsReconcile: root.mode === 'sync' });
+    });
+  }
+  async updateRoot(root: Root) {
+    this.validateRoot(root);
+    await this.changeConfiguration(() => {
+      this.validateRoot(root);
+      const previous = this.journal.roots().find((item) => item.id === root.id);
+      if (!previous) throw new Error('Folder was not found.');
+      if (previous.localPath !== root.localPath || previous.remoteId !== root.remoteId)
+        this.journal.resetRootFiles(root.id);
+      // A newly chosen location may be on another drive; it is recorded when next checked.
+      const same = previous.localPath === root.localPath;
+      this.journal.root({
+        ...root,
+        volume: same ? previous.volume : undefined,
+        network: same ? previous.network : undefined,
+        needsReconcile: root.mode === 'sync',
+      });
+      this.rootRetry.delete(root.id);
+      this.state.issues = this.state.issues.filter(
+        (issue) => issue.rootId !== root.id || stickyIssue(issue),
+      );
+      this.persistIssues();
+    });
+  }
+  async removeSyncedFolder(folderId: string) {
+    const own = this.journal.roots().filter((root) => root.remoteId === folderId);
+    for (const root of own) this.leaving.add(root.id);
+    try {
+      await this.api.request(`/v1/sync/folders/${folderId}`, { method: 'DELETE' });
+      await this.changeConfiguration(() => {
+        for (const root of this.journal.roots()) {
+          if (root.mode !== 'sync') continue;
+          if (root.remoteId === folderId) this.journal.removeRoot(root.id);
+          else this.excludeRemovedFolder(root, folderId);
+        }
+        this.state.issues = this.state.issues.filter(
+          (issue) => !issue.rootId || this.journal.roots().some((r) => r.id === issue.rootId),
+        );
+        this.persistIssues();
+      });
+    } finally {
+      for (const root of own) this.leaving.delete(root.id);
+    }
+  }
+  private excludeRemovedFolder(root: Root, folderId: string) {
+    const known = this.journal.fileByItem(root.id, folderId);
+    if (!known || known.type !== 'FOLDER') return;
+    this.journal.root({ ...root, excluded: [...new Set([...root.excluded, known.relativePath])] });
+    for (const job of this.journal.jobs())
+      if (
+        job.rootId === root.id &&
+        (job.relativePath === known.relativePath ||
+          job.relativePath.startsWith(known.relativePath + '/'))
+      )
+        this.journal.drop(job.id);
+    for (const file of this.journal.files(root.id))
+      if (
+        file.relativePath === known.relativePath ||
+        file.relativePath.startsWith(known.relativePath + '/')
+      )
+        this.journal.deleteFile(root.id, file.relativePath);
+  }
+  private async detachRoot(root: Root, reason: 'revoked' | 'deleted' | 'removed' | 'backup') {
+    await this.watchers.get(root.id)?.close();
+    this.watchers.delete(root.id);
+    this.journal.removeRoot(root.id);
+    this.forgetWaiting(root.id);
+    this.state.issues = this.state.issues.filter((issue) => issue.rootId !== root.id);
+    if (!this.leaving.has(root.id)) {
+      // The folder leaves the list, so say why in a notice that stays until dismissed.
+      const name = path.basename(root.localPath);
+      const owner = root.sharedByName ?? 'The owner';
+      const what = {
+        revoked: `${owner} stopped sharing “${name}” with you.`,
+        deleted: root.shareId
+          ? `${owner} moved “${name}” to the trash or deleted it, so it stopped syncing. If it is restored, accept the invitation again to resume.`
+          : `“${name}” was moved to the trash or deleted in the cloud, so it stopped syncing.`,
+        removed: root.shareId
+          ? `“${name}” stopped syncing: it was removed from sync on another device.`
+          : `“${name}” was removed from sync on another device.`,
+        backup: `Backups of “${name}” were turned off on another device.`,
+      }[reason];
+      const message = `${what} Your local files are still in ${root.localPath}.`;
+      this.state.issues.push({
+        id: `detached:${root.id}`,
+        rootId: '',
+        code: 'SYNC_DETACHED',
+        relativePath: name,
+        conflictPath: root.localPath,
+        message,
+        at: new Date().toISOString(),
+      });
+      this.notify(root.mode === 'backup' ? 'Backup stopped' : 'Folder stopped syncing', message);
+    }
+    this.persistIssues();
+    this.emit();
+  }
+  async removeRoot(id: string) {
+    await this.changeConfiguration(() => {
+      this.journal.removeRoot(id);
+      this.state.issues = this.state.issues.filter((issue) => issue.rootId !== id);
+      this.persistIssues();
+    });
+  }
+  dismissConflict(id: string) {
+    this.state.issues = this.state.issues.filter((issue) => issue.id !== id || !stickyIssue(issue));
+    this.persistIssues();
+    this.emit();
+  }
+  private persistIssues() {
+    this.journal.set('syncIssues', this.state.issues);
+  }
+  private forgetWaiting(rootId: string) {
+    for (const [id, item] of this.waiting) if (item.rootId === rootId) this.waiting.delete(id);
+  }
+  // Errors that are not about one file or folder: stop the pass and retry everything later.
+  private interrupts(error: unknown) {
+    if (error instanceof ApiError)
+      return (
+        error.status >= 500 ||
+        error.status === 429 ||
+        ['AUTH_INVALID', 'DEVICE_REVOKED', 'SYNC_REMOVED', 'SYNC_CURSOR_EXPIRED'].includes(
+          error.code,
+        )
+      );
+    return (
+      error instanceof TypeError ||
+      ['AbortError', 'TimeoutError'].includes((error as Error | undefined)?.name ?? '')
+    );
+  }
+  private rootFailed(root: Root, error: unknown) {
+    const attempts = (this.rootRetry.get(root.id)?.attempts ?? 0) + 1;
+    this.rootRetry.set(root.id, { attempts, at: Date.now() + retryDelay(attempts) });
+    // A full reconcile repairs whatever this pass could not apply.
+    const current = this.journal.roots().find((item) => item.id === root.id);
+    if (current && !current.needsReconcile) this.journal.root({ ...current, needsReconcile: true });
+    this.issue(root.id, error);
+  }
+  /**
+   * The sync queue, a page at a time: deleted folders go last, deepest first, so their contents
+   * are handled before them. Jobs queued while this pass runs wait for the next.
+   */
+  private *syncQueue(rootIds: string[]) {
+    const folders: LocalJob[] = [];
+    const before = Date.now();
+    let after: { createdAt: number; id: string } | null = null;
+    for (;;) {
+      const page = this.journal.jobsPage(rootIds, after, before, QUEUE_PAGE);
+      if (!page.jobs.length) break;
+      after = page.last;
+      for (const job of page.jobs)
+        if (
+          job.kind === 'delete' &&
+          this.journal.file(job.rootId, job.relativePath)?.type === 'FOLDER'
+        )
+          folders.push(job);
+        else yield job;
+    }
+    const depth = (job: LocalJob) => job.relativePath.split('/').length;
+    yield* folders.sort((a, b) => depth(b) - depth(a));
+  }
+  /** A batched file's refusal: retried alone, sent again, or failed like a single upload. */
+  private batchFailure(error: {
+    code?: string;
+    message?: string;
+    details?: unknown;
+  }): BatchOutcome {
+    // Not reached, or the account busy with another change: sent again.
+    if (error?.code === 'BATCH_NOT_REACHED' || error?.code === 'CONCURRENT_UPDATE')
+      return { notReached: true };
+    // Already in the cloud, or an upload of its own got further: the single-file path sorts it out.
+    if (
+      [
+        'NAME_CONFLICT',
+        'REVISION_CONFLICT',
+        'INVALID_UPLOAD_STATE',
+        'IDEMPOTENCY_KEY_REUSED',
+      ].includes(error?.code ?? '')
+    )
+      return { alone: true };
+    return {
+      error: new ApiError(
+        error?.code ?? 'UPLOAD_FAILED',
+        error?.message ?? 'The file could not be uploaded.',
+        409,
+        undefined,
+        error?.details,
+      ),
+    };
+  }
+  /**
+   * See BackupBatch. Several small new files of a backup run: one request creates their uploads
+   * (each with one storage link), they go to storage side by side, and one request finishes them
+   * and records them in the run. A file's upload is kept with its job as soon as it exists, so
+   * one the batch doesn't finish resumes alone instead of starting over.
+   */
+  private async backupBatch(
+    root: Root,
+    jobs: LocalJob[],
+    runId: string,
+  ): Promise<Map<string, BatchOutcome> | null> {
+    const outcomes = new Map<string, BatchOutcome>();
+    // An encrypted account's files are encrypted one by one before they go; their names are
+    // encrypted on the way by the API client's E2EE layer.
+    const keys = transferKeys.upload();
+    const backup = { rootId: root.backupId!, runId };
+    const base = `/v1/backups/${backup.rootId}/runs/${runId}`;
+    const prepared: BatchFile[] = [];
+    for (const job of jobs) {
+      const absolute = contained(root.localPath, job.relativePath);
+      try {
+        await safeParents(root.localPath, job.relativePath, false);
+        const parentId = await this.remoteParent(root, job.relativePath, backup);
+        const info = await lstat(absolute);
+        const hash = await hashFile(absolute);
+        const hashed = await lstat(absolute);
+        if (hashed.mtimeMs !== info.mtimeMs || hashed.size !== info.size) {
+          outcomes.set(job.id, { alone: true });
+          continue;
+        }
+        const operationId = (job.payload.upload?.operationId as string | undefined) ?? job.id;
+        // Encryption adds a little to every file; one that then outgrows a batch goes alone.
+        if (keys && encryptedSize(info.size) > BATCH_UPLOAD_MAX_BYTES) {
+          outcomes.set(job.id, { alone: true });
+          continue;
+        }
+        const cipher = keys ? await FileCipher.create(keys) : undefined;
+        prepared.push({ job, absolute, info, hash, parentId, operationId, cipher });
+      } catch (error) {
+        if (this.interrupts(error)) throw error;
+        outcomes.set(job.id, { error: error as Error });
+      }
+    }
+    if (!prepared.length) return outcomes;
+    this.state.active = {
+      rootId: root.id,
+      direction: 'upload',
+      relativePath: prepared[0].job.relativePath,
+      loaded: 0,
+      total: prepared.reduce((sum, file) => sum + file.info.size, 0),
+    };
+    this.state.message = `Uploading ${prepared.length} files`;
+    this.emit();
+    try {
+      return await this.sendBatch(
+        root,
+        { create: `${base}/uploads/batch`, finish: `${base}/files/batch`, backup: true },
+        prepared,
+        outcomes,
+      );
+    } finally {
+      this.state.active = null;
+      this.emit();
+    }
+  }
+  /**
+   * A synced folder's change that may go in a batch: a small file, new or edited, with no upload
+   * of its own under way. Anything else, or anything a batch can't settle, goes alone.
+   */
+  private batchable(root: Root, job: LocalJob) {
+    return (
+      root.mode === 'sync' &&
+      job.kind === 'upsert' &&
+      job.payload.entry?.type === 'FILE' &&
+      (job.payload.entry.sizeBytes ?? Infinity) <= BATCH_UPLOAD_MAX_BYTES &&
+      !job.payload.upload?.uploadId &&
+      !job.payload.relayVersion
+    );
+  }
+  /**
+   * Uploads a synced folder's small changed files together: each is checked as on its own, then
+   * all start in one request, go to storage side by side and finish in one more. `plans` holds
+   * the files checked and found to need the single-file path. Null when the server has no batch
+   * routes.
+   */
+  private async syncBatch(root: Root, jobs: LocalJob[]) {
+    const outcomes = new Map<string, BatchOutcome>();
+    const plans = new Map<string, UploadPlan>();
+    const keys = transferKeys.upload();
+    const prepared: BatchFile[] = [];
+    for (const job of jobs) {
+      try {
+        const plan = await this.uploadPlan(root, job);
+        // Settled while being checked: unchanged, renamed, or no longer there.
+        if (!plan) {
+          outcomes.set(job.id, { saved: true });
+          continue;
+        }
+        const { info, state } = plan;
+        if (
+          state.uploadId ||
+          state.hash !== plan.hash ||
+          info.size > BATCH_UPLOAD_MAX_BYTES ||
+          (keys && encryptedSize(info.size) > BATCH_UPLOAD_MAX_BYTES)
+        ) {
+          plans.set(job.id, plan);
+          outcomes.set(job.id, { alone: true });
+          continue;
+        }
+        prepared.push({
+          job,
+          absolute: plan.absolute,
+          info,
+          hash: plan.hash,
+          parentId: plan.parentId,
+          operationId: state.operationId,
+          cipher: keys ? await FileCipher.create(keys) : undefined,
+          known: plan.known && { itemId: plan.known.itemId, revision: plan.known.revision },
+        });
+      } catch (error) {
+        if (this.interrupts(error)) throw error;
+        outcomes.set(job.id, { error: error as Error });
+      }
+    }
+    if (!prepared.length) return { outcomes, plans };
+    this.state.active = {
+      rootId: root.id,
+      direction: 'upload',
+      relativePath: prepared[0].job.relativePath,
+      loaded: 0,
+      total: prepared.reduce((sum, file) => sum + file.info.size, 0),
+    };
+    this.state.message = `Uploading ${prepared.length} files`;
+    this.emit();
+    try {
+      const sent = await this.sendBatch(
+        root,
+        { create: '/v1/uploads/batch', finish: '/v1/uploads/batch/finish', backup: false },
+        prepared,
+        outcomes,
+      );
+      return sent && { outcomes: sent, plans };
+    } finally {
+      this.state.active = null;
+      this.emit();
+    }
+  }
+  /**
+   * The storage and finishing half of a batch, for files whose folders and hashes are ready.
+   * Null when the server has no batch routes.
+   */
+  private async sendBatch(
+    root: Root,
+    routes: BatchRoutes,
+    prepared: BatchFile[],
+    outcomes: Map<string, BatchOutcome>,
+  ): Promise<Map<string, BatchOutcome> | null> {
+    const alone = (list: { job: LocalJob }[]) => {
+      for (const { job } of list) outcomes.set(job.id, { alone: true });
+      return outcomes;
+    };
+    let created: {
+      upload?: { id: string; partSizeBytes: number };
+      uploadUrl?: string;
+      error?: any;
+    }[];
+    try {
+      created = (
+        await this.api.request(routes.create, {
+          method: 'POST',
+          body: {
+            uploads: prepared.map((file) => ({
+              operationId: file.operationId,
+              parentId: file.parentId,
+              name: path.basename(file.absolute),
+              // The server only ever sees the encrypted size and hash of an encrypted file.
+              ...(file.cipher
+                ? { sizeBytes: encryptedSize(file.info.size), encrypted: true }
+                : { sizeBytes: file.info.size, contentHash: file.hash }),
+              mimeType: 'application/octet-stream',
+              modifiedAt: modifiedAt(file.info),
+              ...(file.known
+                ? { driveItemId: file.known.itemId, baseRevision: file.known.revision }
+                : {}),
+            })),
+          },
+        })
+      ).results;
+    } catch (error) {
+      // An older server has no batch routes.
+      if (error instanceof ApiError && error.code === 'NOT_FOUND') return null;
+      if (this.interrupts(error)) throw error;
+      return alone(prepared);
+    }
+    const uploads: ((typeof prepared)[number] & { uploadId: string; uploadUrl: string })[] = [];
+    prepared.forEach((file, n) => {
+      const result = created[n];
+      if (!result?.upload || !result.uploadUrl) {
+        outcomes.set(file.job.id, this.batchFailure(result?.error ?? {}));
+        return;
+      }
+      file.job.payload.upload = {
+        operationId: file.operationId,
+        uploadId: result.upload.id,
+        partSize: result.upload.partSizeBytes,
+        hash: file.hash,
+        size: file.info.size,
+        mtime: file.info.mtimeMs,
+        // Kept so a file the batch doesn't finish resumes alone with the same key.
+        ...(file.cipher ? { header: b64url(file.cipher.header) } : {}),
+      } satisfies UploadState;
+      this.journal.saveJob(file.job);
+      uploads.push({ ...file, uploadId: result.upload.id, uploadUrl: result.uploadUrl });
+    });
+    // To storage side by side; a file that changed meanwhile, or that storage refused, goes alone
+    // and resumes the upload it already has.
+    const etags: (string | undefined)[] = [];
+    // The hash of what was stored, which an encrypted file is finished with.
+    const storedHashes: (string | undefined)[] = [];
+    let next = 0;
+    let interrupted: unknown;
+    let loaded = 0;
+    await Promise.all(
+      Array.from({ length: Math.min(BATCH_PUT_CONCURRENCY, uploads.length) }, async () => {
+        while (next < uploads.length && !interrupted) {
+          const n = next++;
+          const file = uploads[n];
+          try {
+            const buffer = await readFile(file.absolute);
+            const body = file.cipher
+              ? await file.cipher.encryptedRange(
+                  buffer.length,
+                  0,
+                  encryptedSize(buffer.length),
+                  async (begin, end) => buffer.subarray(begin, end),
+                )
+              : buffer;
+            if (file.cipher) {
+              storedHashes[n] = createHash('sha256').update(body).digest('hex');
+              (file.job.payload.upload as UploadState).storedHash = storedHashes[n];
+              this.journal.saveJob(file.job);
+            }
+            const etag = await putPart(
+              this.api,
+              file.job.payload.upload as UploadState,
+              1,
+              body,
+              file.uploadUrl,
+              body.length,
+            );
+            const after = await lstat(file.absolute);
+            if (
+              buffer.length !== file.info.size ||
+              after.mtimeMs !== file.info.mtimeMs ||
+              after.size !== file.info.size
+            )
+              outcomes.set(file.job.id, { alone: true });
+            else etags[n] = etag;
+            loaded += buffer.length;
+            if (this.state.active) this.state.active = { ...this.state.active, loaded };
+            this.emit(true);
+          } catch (error) {
+            if (this.interrupts(error)) interrupted ??= error;
+            else outcomes.set(file.job.id, { alone: true });
+          }
+        }
+      }),
+    );
+    if (interrupted) throw interrupted;
+    const sent = uploads.flatMap((file, n) =>
+      etags[n] ? [{ ...file, etag: etags[n]!, storedHash: storedHashes[n] ?? file.hash }] : [],
+    );
+    if (!sent.length) return outcomes;
+    let finished: { item?: DriveItem; entry?: any; error?: any }[];
+    try {
+      finished = (
+        await this.api.request(routes.finish, {
+          method: 'POST',
+          body: {
+            files: sent.map((file) => ({
+              uploadId: file.uploadId,
+              etag: file.etag,
+              contentHash: file.storedHash,
+              // What the backup run records of each file.
+              ...(routes.backup
+                ? {
+                    relativePath: file.job.relativePath,
+                    modifiedAt: modifiedAt(file.info),
+                    savedAt: new Date().toISOString(),
+                  }
+                : {}),
+            })),
+          },
+        })
+      ).results;
+    } catch (error) {
+      if (this.interrupts(error)) throw error;
+      return alone(sent);
+    }
+    sent.forEach((file, n) => {
+      const result = finished[n];
+      if (!result?.item || (routes.backup && !result.entry)) {
+        outcomes.set(file.job.id, this.batchFailure(result?.error ?? {}));
+        return;
+      }
+      this.journal.putFile({
+        rootId: root.id,
+        relativePath: file.job.relativePath,
+        itemId: result.item.id,
+        revision: result.item.revision,
+        hash: file.hash,
+        type: 'FILE',
+        sizeBytes: file.info.size,
+        mtimeMs: file.info.mtimeMs,
+      });
+      this.receipts.queue(root, file.job.relativePath, result.item, file.hash);
+      this.activity(root, file.job.relativePath, 'upload', result.item);
+      outcomes.set(file.job.id, routes.backup ? { entry: result.entry } : { saved: true });
+    });
+    return outcomes;
+  }
+  /** Files nested deeper than harbor0 stores, listed as one problem per folder. */
+  private tooDeep(root: Root, job: LocalJob) {
+    const jobs = this.deepJobs.get(root.id) ?? new Set<string>();
+    jobs.add(job.id);
+    this.deepJobs.set(root.id, jobs);
+    for (const id of jobs) if (!this.journal.job(id)) jobs.delete(id);
+    const id = `${root.id}:too-deep`;
+    this.state.issues = this.state.issues.filter((issue) => issue.id !== id);
+    this.state.issues.push({
+      id,
+      rootId: root.id,
+      code: 'SYNC_ERROR',
+      scope: 'item',
+      // Kept while any of them waits; see the issue filter in runTick.
+      jobId: jobs.values().next().value,
+      relativePath: job.relativePath.split('/')[0],
+      message: `${jobs.size === 1 ? '1 item is' : `${jobs.size} items are`} inside folders nested more than 32 levels deep, which harbor0 cannot store. Move ${jobs.size === 1 ? 'it' : 'them'} to a shallower folder to sync ${jobs.size === 1 ? 'it' : 'them'}.`,
+      at: new Date().toISOString(),
+    });
+    this.persistIssues();
+    this.emit();
+  }
+  /** Subfolders harbor0 may not read, shown one by one; the rest of the folder still syncs. */
+  private unreadableIssues(root: Root) {
+    // A backup reports them with its run instead.
+    const folders = root.mode === 'sync' ? (this.unreadable.get(root.id) ?? []) : [];
+    const shown = folders.slice(0, UNREADABLE_SHOWN);
+    const ids = new Set(shown.map((folder) => `${root.id}:unreadable:${folder}`));
+    const before = this.state.issues.length;
+    this.state.issues = this.state.issues.filter(
+      (issue) =>
+        issue.rootId !== root.id ||
+        !issue.id.startsWith(`${root.id}:unreadable:`) ||
+        ids.has(issue.id),
+    );
+    let changed = this.state.issues.length !== before;
+    for (const folder of shown) {
+      const id = `${root.id}:unreadable:${folder}`;
+      if (this.state.issues.some((issue) => issue.id === id)) continue;
+      const more = folder === shown.at(-1) ? folders.length - shown.length : 0;
+      this.state.issues.push({
+        id,
+        rootId: root.id,
+        code: 'PERMISSION_DENIED',
+        relativePath: more ? `${folder} (and ${more} more folders)` : folder,
+        message: 'harbor0 does not have permission to read this folder.',
+        scope: 'item',
+        at: new Date().toISOString(),
+      });
+      changed = true;
+    }
+    if (changed) {
+      this.persistIssues();
+      this.emit();
+    }
+  }
+  private issue(rootId: string, error: unknown, relativePath?: string, jobId?: string) {
+    const root = this.journal.roots().find((item) => item.id === rootId);
+    const failedPath = (error as NodeJS.ErrnoException)?.path;
+    // Filesystem errors below the folder itself concern one item, not the folder's own access.
+    const inside =
+      root && typeof failedPath === 'string' ? path.relative(root.localPath, failedPath) : '';
+    const nested = !!inside && !inside.startsWith('..') && !path.isAbsolute(inside);
+    const item = !!jobId || nested;
+    const code = syncIssueCode(error, item);
+    this.state.issues = this.state.issues.filter(
+      (issue) =>
+        issue.rootId !== rootId ||
+        stickyIssue(issue) ||
+        (jobId ? issue.jobId !== jobId : !!issue.jobId),
+    );
+    this.state.issues.push({
+      id: jobId ? `job:${jobId}` : `${rootId}:${code}`,
+      rootId,
+      code,
+      relativePath: relativePath ?? (nested ? inside.split(path.sep).join('/') : undefined),
+      message: (error as Error).message,
+      at: new Date().toISOString(),
+      ...(jobId ? { jobId } : {}),
+      ...(item ? { scope: 'item' as const } : {}),
+      ...(code === 'STORAGE_QUOTA_EXCEEDED'
+        ? { storage: storageNeed(error, !!root?.shareId) }
+        : {}),
+    });
+    this.persistIssues();
+    this.emit();
+  }
+  private deviceName() {
+    return this.journal.get<string>('deviceName') || os.hostname();
+  }
+  private recovered(root: Root, relativePath: string, recoveredPath: string) {
+    this.state.issues.push({
+      id: crypto.randomUUID(),
+      rootId: root.id,
+      code: 'FOLDER_RECOVERED',
+      relativePath,
+      conflictPath: recoveredPath,
+      message:
+        'This folder was removed from sync elsewhere. The copy on this computer was kept under a new name and no longer syncs.',
+      at: new Date().toISOString(),
+    });
+    this.persistIssues();
+    this.emit();
+  }
+  private conflict(root: Root, relativePath: string, conflictPath: string) {
+    this.state.issues.push({
+      id: crypto.randomUUID(),
+      rootId: root.id,
+      code: 'CONFLICT',
+      relativePath,
+      conflictPath,
+      message:
+        'This file changed in more than one place. Your local version has been preserved separately.',
+      at: new Date().toISOString(),
+    });
+    this.persistIssues();
+    this.emit();
+  }
+  private activity(
+    root: Root,
+    relativePath: string,
+    direction: 'upload' | 'download',
+    item?: DriveItem,
+  ) {
+    const at = new Date().toISOString();
+    this.state.recent = [
+      { id: crypto.randomUUID(), rootId: root.id, direction, relativePath, at, item },
+      ...this.state.recent,
+    ].slice(0, 30);
+    this.journal.set('syncRecent', this.state.recent);
+    const current = this.journal.roots().find((item) => item.id === root.id);
+    if (current) this.journal.root({ ...current, lastSyncedAt: at });
+    // Upload jobs remain active until their queue entry has been removed.
+    if (direction === 'download') {
+      this.finished(root.id);
+      this.state.active = null;
+      this.emit();
+    }
+  }
+  /**
+   * The folder as it can be used now — moved, when its drive came back at another mount point —
+   * or null when it is unavailable, with the reason recorded as the folder's issue.
+   */
+  private async checkRoot(root: Root): Promise<Root | null> {
+    const mount = volumeRoot(root.localPath);
+    // A share that is away is missing from the mount table, so its kind is remembered.
+    const network = !!mount && ((await isNetwork(mount)) || !!root.network);
+    if (network !== !!root.network) {
+      root = { ...root, network: network || undefined };
+      this.journal.root(root);
+    }
+    if (network) this.shares.set(root.id, mount);
+    else this.shares.delete(root.id);
+    try {
+      return await this.onShare(root, () => this.checkLocation(root));
+    } catch (error) {
+      const code = (error as { code?: string }).code;
+      if (
+        code === 'DRIVE_MISSING' ||
+        code === 'WRONG_DRIVE' ||
+        code === 'SHARE_UNAVAILABLE' ||
+        code === 'FOLDER_UNAVAILABLE'
+      ) {
+        // Whatever is mounted there now is not this folder; nothing of it may be queued.
+        await this.watchers.get(root.id)?.close();
+        this.watchers.delete(root.id);
+        this.scannedAt.delete(root.id);
+      }
+      if (root.mode === 'sync') this.journal.root({ ...root, needsReconcile: true });
+      this.issue(root.id, error);
+      return null;
+    }
+  }
+  private async checkLocation(root: Root) {
+    root = await this.checkVolume(root);
+    const info = await lstat(root.localPath).catch((error: NodeJS.ErrnoException) => {
+      // There but unreadable, as a share that disconnected answers: said in plain words.
+      if (error.code !== 'ENOENT' && error.code !== 'EACCES' && error.code !== 'EPERM')
+        throw folderUnreadable(root, error);
+      if (error.code !== 'ENOENT') throw error;
+      throw Object.assign(
+        new Error(
+          `“${path.basename(root.localPath)}” can’t be found at ${root.localPath}. It may have been moved, renamed or deleted.`,
+        ),
+        { code: 'ENOENT' },
+      );
+    });
+    if (!info.isDirectory() || info.isSymbolicLink())
+      throw Object.assign(new Error('The local folder is unavailable.'), { code: 'ENOTDIR' });
+    // Backing up only reads the folder, so a read-only drive is fine.
+    await access(
+      root.localPath,
+      root.mode === 'backup' ? constants.R_OK : constants.R_OK | constants.W_OK,
+    );
+    return root;
+  }
+  /**
+   * Runs one look at a folder's files, time-limited when the folder is on a network share. A
+   * share that stopped answering would otherwise hold up every other folder; once a request
+   * times out, nothing more is sent to that share until it returns.
+   */
+  private async onShare<T>(root: Root, work: () => Promise<T>): Promise<T> {
+    const share = this.shares.get(root.id);
+    if (!share) return work();
+    if (this.stalledShares.has(share)) throw this.shareUnavailable(root, share, 'responding');
+    const task = work();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timeout = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => {
+        this.stalledShares.add(share);
+        void task.then(
+          () => this.stalledShares.delete(share),
+          () => this.stalledShares.delete(share),
+        );
+        reject(this.shareUnavailable(root, share, 'responding'));
+      }, NETWORK_TIMEOUT);
+    });
+    try {
+      return await Promise.race([task, timeout]);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+  private shareUnavailable(root: Root, share: string, state: 'connected' | 'responding') {
+    const resumes = root.mode === 'backup' ? 'Backups resume' : 'Syncing resumes';
+    return Object.assign(
+      new Error(
+        `The network share “${volumeLabel(share)}” isn’t ${state}. ${resumes} when it’s back.`,
+      ),
+      { code: 'SHARE_UNAVAILABLE' },
+    );
+  }
+  /**
+   * A folder on a removable or secondary drive belongs to that drive: once recorded, another
+   * drive mounted at the same place (same volume name on macOS, same letter on Windows) is
+   * refused, and the folder follows its own drive to wherever it is mounted now.
+   */
+  private async checkVolume(root: Root) {
+    const mount = volumeRoot(root.localPath);
+    if (!mount) return root;
+    const connected = await volumeConnected(mount);
+    // Null for a drive without one (a network share, some file systems): those are not checked.
+    const id = connected ? await volumeId(mount) : null;
+    const recorded = root.volume?.root === mount ? root.volume : undefined;
+    if (!recorded) {
+      // First seen here, or the user chose a new location: this is the folder's drive.
+      if (id && (await lstat(root.localPath).catch(() => null))?.isDirectory()) {
+        root = { ...root, volume: { root: mount, id } };
+        this.journal.root(root);
+      }
+      if (connected) return root;
+    } else if (id === recorded.id || (connected && !id)) return root;
+    else {
+      const moved = await this.followVolume(root, recorded);
+      if (moved) return moved;
+    }
+    if (!connected && this.shares.has(root.id))
+      throw this.shareUnavailable(root, mount, 'connected');
+    const name = volumeLabel(mount);
+    const resumes = root.mode === 'backup' ? 'Backups resume' : 'Syncing resumes';
+    throw Object.assign(
+      new Error(
+        connected
+          ? `A different drive is connected as “${name}”. ${resumes} when you connect the drive this folder is on.`
+          : `The drive “${name}” isn’t connected. ${resumes} when you connect it.`,
+      ),
+      { code: connected ? 'WRONG_DRIVE' : 'DRIVE_MISSING' },
+    );
+  }
+  private async followVolume(root: Root, volume: Volume) {
+    if (Date.now() < (this.nextVolumeSearch.get(root.id) ?? 0)) return null;
+    this.nextVolumeSearch.set(root.id, Date.now() + VOLUME_SEARCH_INTERVAL);
+    const found = await findVolume(volume.id);
+    if (!found || found === volume.root) return null;
+    const localPath = path.join(found, path.relative(volume.root, root.localPath));
+    const info = await lstat(localPath).catch(() => null);
+    if (!info?.isDirectory() || info.isSymbolicLink()) return null;
+    const moved: Root = { ...root, localPath, volume: { root: found, id: volume.id } };
+    try {
+      this.validateRoot(moved);
+    } catch {
+      return null;
+    }
+    await this.watchers.get(root.id)?.close();
+    this.watchers.delete(root.id);
+    this.scannedAt.delete(root.id);
+    this.nextVolumeSearch.delete(root.id);
+    this.journal.root(moved);
+    this.emit();
+    return moved;
+  }
+  async reconcile(root: Root) {
+    if (root.mode === 'backup' || root.paused || this.state.paused || this.stopped) return;
+    const seen = new Set<string>();
+    this.forgetWaiting(root.id);
+    // The listing gives each item's path directly, so nothing is looked up item by item.
+    const walk = async (parent: string | null, parentPath: string) => {
+      let cursor: string | undefined;
+      do {
+        const page = await this.api.list(parent, cursor);
+        const pendingPaths = this.journal.pendingPaths(root.id);
+        for (const item of page.items) {
+          if (this.stopped || this.state.paused) return;
+          seen.add(item.id);
+          const segment = this.localName(root, item, parentPath);
+          const relative = parentPath ? `${parentPath}/${segment}` : segment;
+          if (this.ignored(root, relative)) continue;
+          const known = this.journal.fileByItem(root.id, item.id);
+          const unchanged =
+            known?.revision === item.revision &&
+            known.relativePath === relative &&
+            item.cloudState !== 'REQUESTED';
+          // A shared-folder scan can be triggered by an unrelated sibling edit.
+          // Do not overwrite this device's queued edits/deletes when this item is unchanged.
+          // An item that matches the journal and the disk needs no work at all.
+          if (!(unchanged && (pendingPaths.has(relative) || (await this.matchesDisk(root, known)))))
+            await this.remoteItem(root, item, relative);
+          if (item.type === 'FOLDER') await walk(item.id, relative);
+        }
+        cursor = page.nextCursor ?? undefined;
+      } while (cursor);
+    };
+    const rootItem = (await this.api.request(`/v1/drive/items/${root.remoteId}`)).item;
+    if (rootItem) this.receipts.queue(root, '.', rootItem, null);
+    await walk(root.remoteId, '');
+    // Paused or unavailable folders can miss feed events while other folders advance
+    // the device cursor. Check tracked items absent from the current subtree.
+    for (const known of this.journal.files(root.id)) {
+      if (this.stopped || this.state.paused) return;
+      if (seen.has(known.itemId) || this.ignored(root, known.relativePath)) continue;
+      try {
+        const { item } = await this.api.request(`/v1/drive/items/${known.itemId}`);
+        await this.remoteItem(root, item);
+      } catch (error) {
+        if (error instanceof ApiError && error.code === 'SYNC_REMOVED') continue;
+        if (
+          !(error instanceof ApiError) ||
+          !['ITEM_NOT_FOUND', 'PARENT_NOT_FOUND', ...(root.shareId ? ['FORBIDDEN'] : [])].includes(
+            error.code,
+          )
+        )
+          throw error;
+        if (root.shareId) await this.api.request(`/v1/sync/shares/${root.shareId}/status`);
+        await this.remoteItem(root, {
+          id: known.itemId,
+          revision: known.revision + 1,
+          deletedAt: new Date().toISOString(),
+        } as DriveItem);
+      }
+    }
+  }
+  private async publishSyncFolders() {
+    const folderIds = this.journal
+      .roots()
+      .filter((root) => root.mode === 'sync' && root.remoteId)
+      .map((root) => root.remoteId!)
+      .sort();
+    const signature = JSON.stringify(folderIds);
+    if (
+      this.publishingFolders ||
+      (signature === this.publishedFolders && Date.now() - this.publishedAt < 60000) ||
+      Date.now() < this.publishRetryAt
+    )
+      return;
+    this.publishingFolders = true;
+    try {
+      const response = await this.api.request('/v1/sync/folders', {
+        method: 'PUT',
+        body: { folderIds },
+        signal: AbortSignal.timeout(8000),
+      });
+      for (const id of response.removedFolderIds ?? []) this.removedRemoteIds.add(id);
+      this.publishedFolders = signature;
+      this.publishedAt = Date.now();
+      this.publishRetryAt = 0;
+    } catch {
+      // Retry while offline without interrupting file transfers or local configuration changes.
+      this.publishRetryAt = Date.now() + 15000;
+    } finally {
+      this.publishingFolders = false;
+    }
+  }
+  private confirmStatus() {
+    if (
+      this.stopped ||
+      this.state.paused ||
+      this.confirmationWork ||
+      Date.now() < this.nextConfirmationAt
+    )
+      return;
+    const signal = this.confirmationController.signal;
+    this.confirmationWork = (async () => {
+      try {
+        await this.receipts.flush(signal);
+        if (!signal.aborted) await this.receipts.audit(signal);
+        if (!signal.aborted) await this.receipts.flush(signal);
+      } catch {
+        // Keep the durable outbox and retry independently of file transfer work.
+      } finally {
+        this.confirmationWork = undefined;
+        this.nextConfirmationAt = Date.now() + 5000;
+        if (!signal.aborted) {
+          this.state.confirmationPendingRoots = this.receipts.pendingRoots();
+          if (!this.state.active && !this.journal.jobCount() && !this.state.issues.length) {
+            if (this.state.confirmationPendingRoots.length)
+              this.state.message = 'Files transferred; waiting for backend confirmation';
+            else if (this.state.message === 'Files transferred; waiting for backend confirmation')
+              this.state.message = 'Everything is up to date';
+          }
+          this.emit();
+        }
+      }
+    })();
+  }
+  /** Run a full sync pass now, including the server check. */
+  async tick() {
+    this.outageUntil = 0;
+    this.hurry();
+    return this.run();
+  }
+  /** How backups follow end-to-end encryption being turned on or off; see FolderBackups. */
+  set backupConversion(conversion: BackupConversion | undefined) {
+    this.backups.conversion = conversion;
+  }
+  /** Why sync waits without working, e.g. an encrypted account not yet unlocked here. */
+  hold?: () => string | null;
+  private async run() {
+    const held = this.hold?.();
+    if (held) {
+      if (this.state.message !== held) {
+        this.state.message = held;
+        this.emit();
+      }
+      return;
+    }
+    if (!this.stopped && !this.publishingFolders) this.publishWork = this.publishSyncFolders();
+    this.confirmStatus();
+    if (this.running || this.stopped || (this.state.paused && !this.removedRemoteIds.size)) return;
+    if (Date.now() < this.outageUntil) return;
+    this.work = this.runTick();
+    return this.work;
+  }
+  private async runTick() {
+    this.tickController = new AbortController();
+    this.running = true;
+    this.state.running = true;
+    // Local work runs every tick; server checks only when due.
+    const remote = Date.now() >= this.nextRemoteAt;
+    let active = false;
+    this.hurried = false;
+    // This pass looks for restores before anything else.
+    this.restoreRequested = false;
+    try {
+      for (const root of this.journal.roots())
+        if (root.mode === 'sync' && root.remoteId && this.removedRemoteIds.has(root.remoteId))
+          await this.detachRoot(root, 'removed');
+      this.removedRemoteIds.clear();
+      const available = new Set<string>();
+      // Shared folders check their revisions in parallel instead of one round trip each.
+      const shareStatus = (root: Root) =>
+        this.api.request(`/v1/sync/shares/${root.shareId}/status`);
+      const sharedStatuses = new Map(
+        (remote ? this.journal.roots() : [])
+          .filter((root) => root.shareId)
+          .map((root) => {
+            const request = shareStatus(root);
+            request.catch(() => {}); // Handled in the loop below; this tick may stop early.
+            return [root.id, request] as const;
+          }),
+      );
+      for (let root of this.journal.roots()) {
+        if (this.stopped || this.state.paused) return;
+        if (root.shareId && remote) {
+          try {
+            const status = await (sharedStatuses.get(root.id) ?? shareStatus(root));
+            if (root.sharedSequence !== status.sequence) {
+              root = { ...root, needsReconcile: true, sharedSequence: status.sequence };
+              this.journal.root(root);
+            }
+          } catch (error) {
+            if (
+              error instanceof ApiError &&
+              [
+                'SYNC_ACCESS_REMOVED',
+                'FORBIDDEN',
+                'SYNC_REMOVED',
+                'ITEM_NOT_FOUND',
+                'PARENT_NOT_FOUND',
+              ].includes(error.code)
+            ) {
+              await this.detachRoot(
+                root,
+                ['SYNC_ACCESS_REMOVED', 'FORBIDDEN'].includes(error.code) ? 'revoked' : 'deleted',
+              );
+              continue;
+            }
+            throw error;
+          }
+        }
+        if (root.archive === 'archived') continue;
+        if (root.archive === 'restoring' && !root.paused)
+          await mkdir(root.localPath, { recursive: true });
+        if (root.paused) continue;
+        const checked = await this.checkRoot(root);
+        if (!checked) continue;
+        root = checked;
+        if (
+          root.mode === 'sync' &&
+          this.state.issues.some(
+            (issue) =>
+              issue.rootId === root.id &&
+              [
+                'FOLDER_MISSING',
+                'DRIVE_MISSING',
+                'WRONG_DRIVE',
+                'SHARE_UNAVAILABLE',
+                'FOLDER_UNAVAILABLE',
+              ].includes(issue.code) &&
+              !issue.scope,
+          )
+        ) {
+          // A disappearing volume can generate unlink events for every child.
+          // Rebuild the mapping on recovery instead of replaying those deletions.
+          this.journal.resetRootFiles(root.id);
+        }
+        if (!this.watchers.has(root.id)) await this.watch(root);
+        // A folder being removed or restored has no settled local copy to compare.
+        const interval = this.shares.has(root.id) ? NETWORK_SCAN_INTERVAL : LOCAL_SCAN_INTERVAL;
+        // A backup run under way already lists every file it will save, so the look through the
+        // folder waits until it ends rather than holding it up for minutes after every start;
+        // what changed meanwhile goes in the next run, as it would anyway.
+        const runResumes = root.mode === 'backup' && !!this.backups.run(root.id);
+        if (
+          (!root.archive || root.archive === 'pending') &&
+          !runResumes &&
+          Date.now() - (this.scannedAt.get(root.id) ?? 0) >= interval
+        ) {
+          try {
+            await this.scanLocal(root);
+          } catch (error) {
+            if ((error as { code?: string }).code !== 'SHARE_UNAVAILABLE') throw error;
+            await this.watchers.get(root.id)?.close();
+            this.watchers.delete(root.id);
+            this.issue(root.id, error);
+            continue;
+          }
+        }
+        available.add(root.id);
+        this.currentRootId = root.id;
+        // Keep a problem visible while its file or folder is still waiting to retry.
+        const retrying = (this.rootRetry.get(root.id)?.at ?? 0) > Date.now();
+        this.state.issues = this.state.issues.filter(
+          (issue) =>
+            issue.rootId !== root.id ||
+            stickyIssue(issue) ||
+            (issue.jobId ? !!this.journal.job(issue.jobId) : retrying),
+        );
+        this.unreadableIssues(root);
+        if (root.needsReconcile && root.mode === 'sync' && !retrying) {
+          try {
+            await this.reconcile(root);
+          } catch (error) {
+            if (this.interrupts(error)) throw error;
+            // One blocked folder must not stop the others or this folder's own uploads.
+            this.rootFailed(root, error);
+            continue;
+          }
+          if (this.stopped || this.state.paused) return;
+          active = true;
+          this.rootRetry.delete(root.id);
+          const current = this.journal.roots().find((item) => item.id === root.id);
+          if (current) this.journal.root({ ...current, needsReconcile: false });
+        }
+      }
+      for (const root of this.journal
+        .roots()
+        // Backup runs wait for the server check; an archive in progress keeps the fast rate.
+        .filter(
+          (r) => r.mode === 'backup' && !r.paused && available.has(r.id) && (remote || r.archive),
+        )) {
+        if (this.stopped || this.state.paused) return;
+        if (root.archive) active = true;
+        this.currentRootId = root.id;
+        const stopped = () => this.stopped || this.state.paused;
+        try {
+          if (root.archive === 'restoring') {
+            this.state.message = 'Restoring archived folder';
+            await this.backups.unarchive(root, stopped);
+            continue;
+          }
+          if (root.archive !== 'removing') {
+            // A backup run resumes from the journal, so it pauses between files when a
+            // local edit or live update arrives instead of holding up sync for the whole run.
+            // Every saved file brings a live update of its own, so it gives way at most every
+            // few seconds rather than starting a new pass after each file.
+            const previous = this.state.message;
+            const preparing = `Getting ${path.basename(root.localPath)} ready to back up…`;
+            if (!this.backups.run(root.id) && this.journal.pendingCount(root.id)) {
+              this.state.message = preparing;
+              this.emit();
+            }
+            let yielded = false;
+            const resumed = Date.now();
+            try {
+              await this.backups.process(
+                root,
+                (r, job) => this.localJob(r, job),
+                () =>
+                  stopped() || (yielded = this.hurried && Date.now() - resumed >= BACKUP_YIELD_MS),
+                (checked, found) => this.setChecking(root.id, { found, checked }),
+              );
+            } finally {
+              // Files still waiting to be unchanged long enough start no run; nothing is being prepared.
+              if (this.state.message === preparing) this.state.message = previous;
+              if (this.state.checking?.[root.id]) this.setChecking(root.id, undefined);
+            }
+            // A run with files left is work in progress: check in again promptly rather than
+            // backing off as if idle, which left a backup waiting up to a minute between turns.
+            if (yielded || this.backups.run(root.id)) active = true;
+            if (yielded) continue;
+          }
+          const current = this.journal.roots().find((r) => r.id === root.id);
+          if (current?.archive && !stopped())
+            await this.backups.archive(
+              current,
+              async () => {
+                await this.watchers.get(root.id)?.close();
+                this.watchers.delete(root.id);
+              },
+              stopped,
+            );
+        } catch (error) {
+          if (error instanceof ApiError && error.code === 'BACKUP_DISCONNECTED')
+            await this.detachRoot(root, 'backup');
+          // Its folder can't be read now: shown on the folder, and the other folders go on.
+          else if ((error as { code?: string }).code === 'FOLDER_UNAVAILABLE')
+            this.issue(root.id, error);
+          else throw error;
+        }
+      }
+      await this.releaseUploads();
+      // Free cloud storage by folder, once an upload was refused for lack of it this pass.
+      const full = new Map<string, number>();
+      // Backup jobs are saved by their runs above; a backup can queue hundreds of thousands, too
+      // many to read again on every pass.
+      const syncRoots = new Map(
+        this.journal
+          .roots()
+          .filter((r) => r.mode === 'sync')
+          .map((r) => [r.id, r]),
+      );
+      const backupsWaiting = this.journal
+        .roots()
+        .some((r) => r.mode === 'backup' && !r.paused && this.journal.pendingCount(r.id));
+      // One queued change, done by `work`; a failure waits for its own retry and the rest go on.
+      const run = async (root: Root, job: LocalJob, work: () => Promise<void>) => {
+        active = true;
+        this.currentRootId = root.id;
+        try {
+          await work();
+          this.journal.finish(job.id);
+          this.finished(root.id);
+          if (this.state.issues.some((issue) => issue.jobId === job.id)) {
+            this.state.issues = this.state.issues.filter((issue) => issue.jobId !== job.id);
+            this.persistIssues();
+          }
+          this.state.active = null;
+          this.emit();
+        } catch (e) {
+          // An ended pass is not this file's failure; it simply runs again next pass.
+          if (this.tickController.signal.aborted) throw e;
+          // The account was busy with another change: this file simply goes again shortly.
+          if (e instanceof ApiError && e.code === 'CONCURRENT_UPDATE') {
+            this.journal.saveJob(job);
+            throw e;
+          }
+          // The account is full: not this file's problem. It waits, untried, with every other
+          // upload, until space is freed (see storageFreed); the rest of the queue carries on.
+          if (
+            e instanceof ApiError &&
+            syncIssueCode(e) === 'STORAGE_QUOTA_EXCEEDED' &&
+            !root.shareId
+          ) {
+            this.storageIsFull(storageNeed(e, false), e.message);
+            this.state.active = null;
+            return;
+          }
+          job.attempts++;
+          job.error = (e as Error).message;
+          if (this.interrupts(e)) {
+            this.journal.saveJob(job);
+            throw e;
+          }
+          // A path harbor0 never accepts waits a day and is listed with the others like it.
+          if (e instanceof ApiError && e.code === 'PATH_TOO_DEEP') {
+            job.payload.retryAt = Date.now() + REFUSED_PATH_RETRY_MS;
+            this.journal.saveJob(job);
+            this.tooDeep(root, job);
+            this.state.active = null;
+            return;
+          }
+          // One failing file waits for its own retry, longer each time; the rest of the queue keeps
+          // moving. After a few tries it waits for the file to change, or for Resume.
+          let shown = e;
+          if (job.attempts >= GIVE_UP_AFTER.sync) {
+            giveUp(
+              job,
+              await lstat(contained(root.localPath, job.relativePath)).catch(() => null),
+            );
+            // Shown as the same kind of problem, saying it waits now.
+            shown = Object.assign(new Error(gaveUpMessage((e as Error).message, 'sync')), {
+              code: (e as { code?: string }).code,
+            });
+            job.error = (shown as Error).message;
+          } else job.payload.retryAt = Date.now() + retryDelay(job.attempts);
+          this.journal.saveJob(job);
+          // Every further upload that does not fit would fail the same way until storage is freed.
+          if (e instanceof ApiError && syncIssueCode(e) === 'STORAGE_QUOTA_EXCEEDED')
+            full.set(root.id, storageNeed(e, !!root.shareId)?.availableBytes ?? 0);
+          this.issue(root.id, shown, job.relativePath, job.id);
+          this.state.active = null;
+        }
+      };
+      // Small changed files, uploaded together; see syncBatch.
+      let group: { root: Root; jobs: LocalJob[] } | undefined;
+      const flush = async () => {
+        if (!group) return;
+        const { root, jobs } = group;
+        group = undefined;
+        active = true;
+        this.currentRootId = root.id;
+        const sent = await this.syncBatch(root, jobs);
+        if (!sent) this.syncBatches = false;
+        for (const job of jobs) {
+          if (this.stopped || this.state.paused) return;
+          const outcome = sent?.outcomes.get(job.id);
+          const plan = sent?.plans.get(job.id);
+          if (!outcome || 'alone' in outcome)
+            await run(root, job, () =>
+              plan ? this.sendUpload(root, job, plan) : this.localJob(root, job),
+            );
+          else if ('error' in outcome)
+            await run(root, job, async () => {
+              throw outcome.error;
+            });
+          else if ('saved' in outcome) await run(root, job, async () => {});
+          // Not reached: sent again on the next pass.
+        }
+      };
+      // Known before the first upload, so a full account uploads nothing.
+      if (!this.state.storage && this.journal.roots().length) await this.refreshStorage();
+      const slice = Date.now();
+      let seen = 0;
+      for (const job of this.syncQueue([...syncRoots.keys()])) {
+        if (this.stopped || this.state.paused) return;
+        // Asked to check in again with a backup waiting: give it its turn; this queue resumes after.
+        if (backupsWaiting && this.hurried && Date.now() - slice >= SYNC_SLICE_MS) break;
+        // Settings changed by this pass (pausing, exclusions) apply to the jobs after it.
+        if (++seen % QUEUE_PAGE === 0)
+          for (const r of this.journal.roots()) if (syncRoots.has(r.id)) syncRoots.set(r.id, r);
+        const root = syncRoots.get(job.rootId);
+        if (
+          !root ||
+          root.mode === 'backup' ||
+          !available.has(root.id) ||
+          root.paused ||
+          this.ignored(root, job.relativePath) ||
+          (job.payload.retryAt ?? 0) > Date.now() ||
+          (job.kind === 'upsert' &&
+            job.payload.entry?.type !== 'FOLDER' &&
+            (job.payload.entry?.sizeBytes ?? Infinity) >
+              (full.get(root.id) ??
+                (root.shareId ? undefined : this.state.storageFull?.availableBytes) ??
+                Infinity))
+        )
+          continue;
+        // A file harbor0 stopped retrying waits until it changes (or Resume brings it back).
+        if (gaveUp(job)) {
+          const info = await lstat(contained(root.localPath, job.relativePath)).catch(() => null);
+          if (unchangedSinceGivingUp(job, info)) continue;
+          revive(job);
+          this.journal.saveJob(job);
+        }
+        if (this.syncBatches && this.batchable(root, job)) {
+          if (group && group.root.id !== root.id) await flush();
+          (group ??= { root, jobs: [] }).jobs.push(job);
+          if (group.jobs.length >= BATCH_UPLOAD_FILES) await flush();
+          continue;
+        }
+        // Earlier changes go first: a folder deleted after its files, a file after its folder.
+        await flush();
+        await run(root, job, () => this.localJob(root, job));
+      }
+      await flush();
+      if (this.stopped || this.state.paused || !remote) return;
+      this.currentRootId = '';
+      let cursor = this.journal.get<number>('cursor') ?? 0;
+      let more = true;
+      // Catching up on a long feed (after days offline, or someone else's big upload) can take
+      // hours. Once it has had a turn, local changes waiting to sync go first; the feed carries
+      // on from the same change on the next pass.
+      const feedStarted = Date.now();
+      let yielded = false;
+      const localWaiting = () =>
+        Date.now() - feedStarted >= SYNC_SLICE_MS &&
+        (this.restoreRequested ||
+          this.journal
+            .roots()
+            .some(
+              (root) =>
+                !root.paused &&
+                (root.mode === 'sync'
+                  ? this.journal.pendingCount(root.id) > 0
+                  : !!this.backups.run(root.id)),
+            ));
+      this.feedItems = new Map();
+      while (more && !this.stopped) {
+        const page = await this.api.changes(cursor);
+        if (page.changes.length) active = true;
+        for (const change of page.changes) {
+          if (localWaiting()) {
+            yielded = true;
+            break;
+          }
+          // Emptied trash, a permanent delete, a cancelled upload or a new quota can free storage.
+          if (['PROFILE_UPDATED', 'FILE_DELETED', 'UPLOAD_ABORTED'].includes(change.type))
+            this.storageFreed();
+          if (change.type === 'BACKUP_DISCONNECTED')
+            for (const root of this.journal
+              .roots()
+              .filter((r) => r.mode === 'backup' && r.remoteId === change.entityId))
+              await this.detachRoot(root, 'backup');
+          if (change.type === 'SYNC_FOLDER_REMOVED')
+            for (const root of this.journal.roots().filter((r) => r.mode === 'sync')) {
+              if (root.remoteId === change.entityId) await this.detachRoot(root, 'removed');
+              else this.excludeRemovedFolder(root, change.entityId);
+            }
+          // Folders waiting to retry are repaired by their next reconcile instead.
+          const targets = () =>
+            this.journal
+              .roots()
+              .filter(
+                (r) =>
+                  r.mode === 'sync' &&
+                  !r.shareId &&
+                  !r.paused &&
+                  available.has(r.id) &&
+                  !this.rootRetry.has(r.id),
+              );
+          const apply = async (root: Root, work: () => Promise<void>) => {
+            this.currentRootId = root.id;
+            try {
+              await work();
+            } catch (error) {
+              if (this.interrupts(error)) throw error;
+              this.rootFailed(root, error);
+            }
+          };
+          if (change.type === 'TRANSFER_SAVED')
+            for (const root of targets()) await apply(root, () => this.reconcile(root));
+          const item = change.item;
+          // The item this change is about may have changed since it was looked up; the folders
+          // above it are looked up again when their own changes come.
+          if (item) this.feedItems.delete(item.id);
+          if (item)
+            for (const root of targets()) await apply(root, () => this.remoteItem(root, item));
+          cursor = change.sequence;
+        }
+        if (yielded) {
+          this.journal.set('cursor', cursor);
+          // Straight back to the feed once the local changes are sent.
+          this.pendingWake = true;
+          break;
+        }
+        cursor = page.nextCursor;
+        this.journal.set('cursor', cursor);
+        more = page.hasMore;
+      }
+      // Anything in the feed may have moved the account's storage: uploads, deletes, an emptied
+      // trash or a new limit.
+      if (active && this.journal.roots().length) await this.refreshStorage();
+      if (this.stopped || this.state.paused) return;
+      this.currentRootId = '';
+      this.state.issues = this.state.issues.filter(
+        (issue) => issue.rootId !== '' || stickyIssue(issue),
+      );
+      this.persistIssues();
+      // Each checkpoint is a database write; only send one when the cursor moved.
+      if (cursor !== this.checkpointed) {
+        await this.api.request('/v1/sync/checkpoints', {
+          method: 'POST',
+          body: { deviceId: this.deviceId, cursor },
+        });
+        this.checkpointed = cursor;
+      }
+      this.state.online = true;
+      this.outages = 0;
+      this.state.lastSync = new Date().toISOString();
+      this.journal.set('lastSync', this.state.lastSync);
+      this.state.confirmationPendingRoots = this.receipts.pendingRoots();
+      const backingUp = this.journal
+        .roots()
+        .find((r) => r.mode === 'backup' && !r.paused && this.backups.run(r.id));
+      this.state.message = this.state.storageFull
+        ? storageFullNow(this.state)
+          ? 'Storage full · uploads paused'
+          : 'Some files need more storage'
+        : this.state.confirmationPendingRoots.length
+          ? 'Files transferred; waiting for backend confirmation'
+          : backingUp
+            ? `Backing up ${path.basename(backingUp.localPath)}`
+            : 'Everything is up to date';
+    } catch (e) {
+      if (e instanceof ApiError && e.code === 'SYNC_REMOVED') {
+        const root = this.journal.roots().find((r) => r.id === this.currentRootId);
+        if (root) {
+          try {
+            await this.api.request(`/v1/drive/items/${root.remoteId}`);
+          } catch (rootError) {
+            if (rootError instanceof ApiError && rootError.code === 'SYNC_REMOVED')
+              await this.detachRoot(root, 'removed');
+          }
+          const folderId = (e.details as { folderId?: string } | undefined)?.folderId;
+          if (folderId && this.journal.roots().some((r) => r.id === root.id))
+            this.excludeRemovedFolder(root, folderId);
+        }
+        return;
+      }
+      if (e instanceof ApiError && e.code === 'SYNC_CURSOR_EXPIRED') {
+        for (const root of this.journal.roots())
+          if (root.mode === 'sync') this.journal.root({ ...root, needsReconcile: true });
+        this.journal.set('cursor', 0);
+      }
+      // Not reaching the server, or the server failing, is an outage for the whole pass.
+      const unavailable = e instanceof TypeError || (e instanceof ApiError && e.status >= 500);
+      // Too many requests, or the account busy with another change (another of the person's
+      // computers saving at the same moment): a short wait, not a problem to show.
+      const busy = e instanceof ApiError && e.code === 'CONCURRENT_UPDATE';
+      const throttled = e instanceof ApiError && (e.status === 429 || busy);
+      if (unavailable || throttled)
+        this.outageUntil = Date.now() + Math.min(60_000, retryDelay(++this.outages));
+      this.state.online = !unavailable;
+      this.state.message = unavailable
+        ? 'harbor0 is unavailable right now. Sync resumes automatically.'
+        : busy
+          ? 'Your account is busy with another change. Syncing continues in a moment.'
+          : throttled
+            ? 'harbor0 is limiting how fast this computer uploads. It continues in a moment.'
+            : (e as Error).message;
+      // A pass ended by the watchdog simply starts again; there is nothing to fix.
+      const restarted = this.tickController.signal.aborted;
+      // An ended session returns the app to sign-in by itself; there is nothing to fix here.
+      const sessionEnded =
+        e instanceof ApiError &&
+        (e.status === 401 || ['AUTH_INVALID', 'DEVICE_REVOKED'].includes(e.code));
+      if (
+        !unavailable &&
+        !throttled &&
+        !restarted &&
+        !sessionEnded &&
+        !(e instanceof ApiError && e.code === 'SYNC_CURSOR_EXPIRED') &&
+        !this.state.issues.some(
+          (issue) => issue.rootId === this.currentRootId && !stickyIssue(issue),
+        )
+      )
+        this.issue(this.currentRootId, e);
+      if (e instanceof ApiError && ['DEVICE_REVOKED', 'AUTH_INVALID'].includes(e.code))
+        this.state.paused = true;
+    } finally {
+      this.feedItems = undefined;
+      // Activity keeps checks every 2s; each quiet or failed check doubles the wait.
+      if (active) {
+        this.remoteDelay = REMOTE_POLL_MIN;
+        this.nextRemoteAt = remote ? Date.now() + REMOTE_POLL_MIN : 0;
+        this.receipts.nudge();
+      } else if (remote) {
+        this.remoteDelay = Math.min(this.maxDelay, this.remoteDelay * 2);
+        this.nextRemoteAt = Date.now() + this.remoteDelay;
+      }
+      // A wake() during this tick still gets its immediate check.
+      if (this.hurried) this.hurry();
+      this.confirmStatus();
+      this.running = false;
+      if (this.pendingWake) {
+        this.pendingWake = false;
+        this.scheduleTick();
+      }
+      this.state.running = false;
+      this.state.active = null;
+      // A folder with nothing left starts its next batch from 0%.
+      const queued = this.journal.jobCounts();
+      for (const id of this.syncDone.keys()) if (!queued.get(id)) this.syncDone.delete(id);
+      this.emit();
+      void this.reporter.flush();
+    }
+  }
+  /**
+   * The child with this name. One that has exactly this name, here or as its name on the
+   * computer it was backed up from, comes first; otherwise one whose name differs only in case.
+   */
+  private async child(parentId: string | null, name: string) {
+    const exact = name.normalize('NFC');
+    const normalized = exact.toLowerCase();
+    let cursor: string | undefined;
+    let other: DriveItem | undefined;
+    do {
+      const page = await this.api.list(parentId, cursor);
+      for (const item of page.items as DriveItem[]) {
+        if ((item.sourceName ?? item.name).normalize('NFC') === exact) return item;
+        if (!other && item.normalizedName === normalized) other = item;
+      }
+      cursor = page.nextCursor ?? undefined;
+    } while (cursor);
+    return other;
+  }
+  /** A free name for a backed up item whose own name is taken here in other capitals. */
+  private async freeAlias(parentId: string | null, name: string) {
+    for (let attempt = 1; attempt < 50; attempt++) {
+      const alias = caseAlias(name, attempt);
+      if (!(await this.child(parentId, alias))) return alias;
+    }
+    throw new Error('Too many files here share this name in different capitals.');
+  }
+  private async ensureFolder(
+    name: string,
+    parentId: string | null,
+    operationId: string = crypto.randomUUID(),
+    backup?: { rootId: string; runId: string },
+  ) {
+    try {
+      return backup
+        ? (
+            await this.api.request(`/v1/backups/${backup.rootId}/runs/${backup.runId}/folders`, {
+              method: 'POST',
+              body: { name, parentId, operationId },
+            })
+          ).item
+        : (await this.api.createFolder(name, parentId, operationId)).item;
+    } catch (e) {
+      if (e instanceof ApiError && e.code === 'NAME_CONFLICT') {
+        const existing = await this.child(parentId, name);
+        const same =
+          !!existing &&
+          (existing.sourceName ?? existing.name).normalize('NFC') === name.normalize('NFC');
+        // In a backup, a folder named the same in other capitals is another folder on the
+        // computer: it gets one of its own here rather than mixing their files.
+        if (existing?.type === 'FOLDER' && (same || !backup)) return existing;
+        if (backup && existing && !same) {
+          const alias = await this.freeAlias(parentId, name);
+          return (
+            await this.api.request(`/v1/backups/${backup.rootId}/runs/${backup.runId}/folders`, {
+              method: 'POST',
+              body: {
+                name: alias,
+                parentId,
+                operationId: crypto.randomUUID(),
+                // An encrypted account's names never go in plain text.
+                ...(transferKeys.upload() ? {} : { sourceName: name }),
+              },
+            })
+          ).item;
+        }
+      }
+      throw e;
+    }
+  }
+  private async remoteParent(
+    root: Root,
+    relative: string,
+    backup?: { rootId: string; runId: string },
+  ): Promise<string | null> {
+    const dirname = path.posix.dirname(relative);
+    if (dirname === '.') return root.remoteId;
+    const cached = this.journal.file(root.id, dirname);
+    if (cached) return cached.itemId;
+    const parentId = await this.remoteParent(root, dirname, backup);
+    const item = await this.ensureFolder(path.posix.basename(dirname), parentId, undefined, backup);
+    this.journal.putFile({
+      rootId: root.id,
+      relativePath: dirname,
+      itemId: item.id,
+      revision: item.revision,
+      hash: null,
+      type: 'FOLDER',
+    });
+    return item.id;
+  }
+  /**
+   * Reads the account's storage, so a full account is known before anything is uploaded, and
+   * space freed elsewhere (an emptied trash, a raised limit) resumes uploads at once.
+   */
+  private async refreshStorage() {
+    const storage = (await this.api.me().catch(() => null))?.storage;
+    if (!storage) return;
+    this.state.storage = storage;
+    this.state.storageAt = Date.now();
+    if (storage.availableBytes < fullBelow(storage.quotaBytes)) {
+      if (!storageFullNow(this.state))
+        this.storageIsFull({ availableBytes: storage.availableBytes });
+    } else if (
+      this.state.storageFull &&
+      storage.availableBytes > this.state.storageFull.availableBytes
+    )
+      this.storageFreed();
+    this.emit();
+  }
+  /** Uploads refused for lack of storage; see SyncRuntime.storageFull. */
+  private storageIsFull(
+    need?: { requiredBytes?: number; availableBytes?: number },
+    // The server's words for the refusal: files refused before, by any version, carry them.
+    refusal?: string,
+  ) {
+    this.state.storageFull = {
+      availableBytes: need?.availableBytes ?? 0,
+      ...(need?.requiredBytes !== undefined ? { requiredBytes: need.requiredBytes } : {}),
+      at: new Date().toISOString(),
+    };
+    this.state.message = storageFullNow(this.state)
+      ? 'Storage full · uploads paused'
+      : 'Some files need more storage';
+    // Earlier passes, or versions, listed refused files one by one with an error and a retry
+    // delay; they now simply wait with the rest, and one notice says why.
+    const refused = this.state.issues.filter(
+      (issue) =>
+        issue.code === 'STORAGE_QUOTA_EXCEEDED' &&
+        issue.jobId &&
+        !this.journal.roots().find((root) => root.id === issue.rootId)?.shareId,
+    );
+    const own = new Set(
+      this.journal
+        .roots()
+        .filter((root) => root.mode === 'sync' && !root.shareId)
+        .map((root) => root.id),
+    );
+    const waiting = new Set(refused.map((issue) => issue.jobId!));
+    if (refusal)
+      for (const rootId of own)
+        for (const job of this.journal.jobs(rootId)) if (job.error === refusal) waiting.add(job.id);
+    for (const id of waiting) {
+      const job = this.journal.job(id);
+      if (!job?.error) continue;
+      job.error = null;
+      job.attempts = 0;
+      delete job.payload.retryAt;
+      this.journal.saveJob(job);
+    }
+    if (refused.length) {
+      this.state.issues = this.state.issues.filter((issue) => !refused.includes(issue));
+      this.persistIssues();
+    }
+    this.emit();
+  }
+  /** Uploads refused for lack of storage try again now instead of waiting out their delay. */
+  storageFreed() {
+    if (this.state.storageFull) {
+      this.state.storageFull = undefined;
+      this.emit();
+    }
+    // Their next run checks again what fits.
+    for (const root of this.journal.roots())
+      if (root.mode === 'backup' && root.backupStorage)
+        this.journal.root({ ...root, backupStorage: undefined });
+    const refused = new Set(
+      this.state.issues
+        .filter((issue) => issue.code === 'STORAGE_QUOTA_EXCEEDED' && issue.jobId)
+        .map((issue) => issue.jobId),
+    );
+    for (const id of refused) {
+      const job = this.journal.job(id!);
+      if (job?.payload.retryAt) {
+        delete job.payload.retryAt;
+        this.journal.saveJob(job);
+      }
+    }
+  }
+  /** The job's partial upload will never complete: free the storage it reserved. */
+  private abandonUpload(job: LocalJob): undefined {
+    if (!job.payload.upload) return;
+    this.journal.abandonUpload(job.payload.upload.uploadId);
+    job.payload.upload = { operationId: crypto.randomUUID() };
+    this.journal.saveJob(job);
+    return undefined;
+  }
+  private async releaseUploads() {
+    for (const uploadId of this.journal.abandonedUploads()) {
+      try {
+        await cancelUpload(this.api, uploadId);
+      } catch {
+        return; // Kept for the next pass; the server is unavailable right now.
+      }
+      this.journal.uploadReleased(uploadId);
+    }
+  }
+  private async localJob(root: Root, job: LocalJob) {
+    const plan = await this.uploadPlan(root, job);
+    if (plan) await this.sendUpload(root, job, plan);
+  }
+  /**
+   * Everything a local change needs before its bytes go: deletes, folders, renames and files
+   * that turn out unchanged are dealt with here and return nothing. A file to upload returns
+   * what sendUpload, or a batch, needs.
+   */
+  private async uploadPlan(root: Root, job: LocalJob): Promise<UploadPlan | undefined> {
+    const absolute = contained(root.localPath, job.relativePath);
+    let known = this.journal.file(root.id, job.relativePath);
+    if (job.kind === 'delete') {
+      try {
+        await lstat(absolute);
+        return;
+      } catch (e) {
+        if ((e as NodeJS.ErrnoException).code !== 'ENOENT') throw e;
+      }
+      if (root.mode === 'backup') return;
+      if (known && (await this.recapitalizedAway(root, job.relativePath))) return;
+      if (known?.type === 'FILE' && (await this.renamedTo(root, known))) return;
+      if (known) {
+        try {
+          await this.api.request(`/v1/drive/items/${known.itemId}`, {
+            method: 'DELETE',
+            body: { operationId: job.id, baseRevision: known.revision },
+          });
+        } catch (e) {
+          if (e instanceof ApiError && e.code === 'REVISION_CONFLICT') {
+            const current = await this.api.request(`/v1/drive/items/${known.itemId}`);
+            await this.remoteItem(root, current.item);
+            return;
+          }
+          if (!(e instanceof ApiError && ['ITEM_NOT_FOUND', 'PARENT_NOT_FOUND'].includes(e.code)))
+            throw e;
+        }
+        this.journal.deleteFile(root.id, job.relativePath);
+      }
+      return;
+    }
+    let info;
+    try {
+      info = await lstat(absolute);
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code === 'ENOENT') return this.abandonUpload(job);
+      throw e;
+    }
+    if (info.isSymbolicLink() || (!info.isFile() && !info.isDirectory()))
+      return this.abandonUpload(job);
+    // A recapitalized parent folder is renamed first: its contents are reported in any order.
+    if (root.mode === 'sync' && !known) {
+      const segments = job.relativePath.split('/');
+      for (let i = 1; i < segments.length; i++) {
+        const folder = segments.slice(0, i).join('/');
+        if (
+          !this.journal.file(root.id, folder) &&
+          (await this.recapitalized(root, folder, 'FOLDER')) === 'alias'
+        )
+          return this.abandonUpload(job);
+      }
+      known = this.journal.file(root.id, job.relativePath);
+    }
+    this.state.active = {
+      rootId: root.id,
+      direction: 'upload',
+      relativePath: job.relativePath,
+      loaded: 0,
+      total: info.isFile() ? info.size : 0,
+    };
+    this.emit();
+    const backup =
+      root.mode === 'backup'
+        ? { rootId: root.backupId!, runId: job.payload.backupRunId as string }
+        : undefined;
+    const parentId = await this.remoteParent(root, job.relativePath, backup);
+    if (info.isDirectory()) {
+      if (
+        root.mode === 'sync' &&
+        !known &&
+        (await this.recapitalized(root, job.relativePath, 'FOLDER'))
+      )
+        return;
+      if (!known) {
+        const item = await this.ensureFolder(path.basename(absolute), parentId, job.id, backup);
+        this.journal.putFile({
+          rootId: root.id,
+          relativePath: job.relativePath,
+          itemId: item.id,
+          revision: item.revision,
+          hash: null,
+          type: 'FOLDER',
+        });
+        this.receipts.queue(root, job.relativePath, item, null);
+        this.activity(root, job.relativePath, 'upload', item);
+      }
+      return;
+    }
+    if (root.mode === 'sync' && !known) {
+      const recapitalized = await this.recapitalized(root, job.relativePath, 'FILE');
+      if (recapitalized === 'alias') return this.abandonUpload(job);
+      if (recapitalized === 'renamed') known = this.journal.file(root.id, job.relativePath);
+    }
+    if (root.mode === 'sync' && !known && (await this.renamedFrom(root, job.relativePath)))
+      return this.abandonUpload(job);
+    // Set when another backed up file here has this one's name in other capitals.
+    let cloudName: string | undefined;
+    let planBackup: UploadPlan['backup'] = backup;
+    if (root.mode === 'backup') {
+      await safeParents(root.localPath, job.relativePath, false);
+      const remote = known
+        ? ((await this.api.request(`/v1/drive/items/${known.itemId}`)).item as DriveItem)
+        : await this.child(parentId, path.basename(absolute));
+      const own = path.basename(absolute).normalize('NFC');
+      if (remote?.type === 'FILE' && (remote.sourceName ?? remote.name).normalize('NFC') !== own) {
+        if (known) throw new Error('This backed up file was renamed in harbor0.');
+        // Stored under a name of its own; it keeps this one for the backup and restores.
+        cloudName = await this.freeAlias(parentId, own);
+        if (backup && !transferKeys.upload()) planBackup = { ...backup, sourceName: own };
+      } else if (remote?.type === 'FILE') {
+        let savedHash = known?.revision === remote.revision ? known.hash : null;
+        if (!savedHash) {
+          const { items } = await this.api.request(`/v1/drive/items/${remote.id}/versions`);
+          savedHash =
+            items.find(
+              (version: { id: string; contentHash: string }) =>
+                version.id === remote.currentVersionId,
+            )?.contentHash ?? null;
+        }
+        known = {
+          rootId: root.id,
+          relativePath: job.relativePath,
+          itemId: remote.id,
+          revision: remote.revision,
+          hash: savedHash,
+          type: 'FILE',
+        };
+        this.journal.putFile(known);
+      }
+    }
+    const hash = await hashFile(absolute);
+    if (job.payload.relayVersion && known) {
+      if (known.hash !== hash) {
+        // An edit arriving while a relay request is queued is still a normal local edit.
+        delete job.payload.relayVersion;
+        this.journal.abandonUpload(job.payload.upload?.uploadId);
+        job.payload.upload = { operationId: crypto.randomUUID() };
+        this.journal.saveJob(job);
+      } else {
+        const current = (await this.api.request(`/v1/drive/items/${known.itemId}`))
+          .item as DriveItem;
+        if (
+          current.cloudState !== 'REQUESTED' ||
+          current.currentVersionId !== job.payload.relayVersion
+        )
+          return this.abandonUpload(job);
+      }
+    } else if (known?.hash === hash) {
+      // Touched but identical: remember its size and time so scans skip it from now on.
+      this.journal.putFile({ ...known, sizeBytes: info.size, mtimeMs: info.mtimeMs });
+      return this.abandonUpload(job);
+    }
+    const state = (job.payload.upload ??= { operationId: job.id }) as UploadState;
+    // Reuse this checksum only when the file remained stable during hashing.
+    // uploadFile checks these attributes again before using it.
+    const hashedInfo = await lstat(absolute);
+    if (!state.uploadId && info.size === hashedInfo.size && info.mtimeMs === hashedInfo.mtimeMs) {
+      state.hash = hash;
+      state.size = info.size;
+      state.mtime = info.mtimeMs;
+    }
+    const verifyBackupQuiet = async () => {
+      if (root.mode !== 'backup' || job.payload.backupManual) return;
+      const current = await lstat(absolute);
+      const queued = this.journal.job(job.id);
+      if (!backupReady(current.mtimeMs, queued?.payload.observedAt ?? job.payload.observedAt ?? 0))
+        throw new FileChangedError(
+          'This file changed recently. Automatic backup will wait until it stops changing.',
+        );
+    };
+    await verifyBackupQuiet();
+    return {
+      absolute,
+      info,
+      hash,
+      parentId,
+      known,
+      state,
+      backup: planBackup,
+      cloudName,
+      verifyBackupQuiet,
+    };
+  }
+  private async sendUpload(root: Root, job: LocalJob, plan: UploadPlan) {
+    const { absolute, parentId, known, state, backup, verifyBackupQuiet, cloudName } = plan;
+    const info = plan.info;
+    let item: DriveItem;
+    this.state.active = {
+      rootId: root.id,
+      direction: 'upload',
+      relativePath: job.relativePath,
+      loaded: 0,
+      total: info.size,
+    };
+    this.emit();
+    try {
+      item = await uploadFile(
+        this.api,
+        absolute,
+        cloudName ?? path.basename(absolute),
+        parentId,
+        state,
+        () => this.journal.saveJob(job),
+        known ? { itemId: known.itemId, revision: known.revision } : undefined,
+        (n, total) => {
+          this.state.active = {
+            rootId: root.id,
+            direction: 'upload',
+            relativePath: job.relativePath,
+            loaded: n,
+            total,
+          };
+          this.state.message = `Uploading ${Math.round((n / Math.max(1, total)) * 100)}%`;
+          this.emit(n < total);
+        },
+        verifyBackupQuiet,
+        backup,
+      );
+    } catch (e) {
+      if (root.mode === 'backup') {
+        // Only this computer adds to its backups, but turning encryption off lets another device
+        // replace a backed up file with its decrypted copy. Its content is the same, so the next
+        // attempt builds on the new revision.
+        if (known && e instanceof ApiError && e.code === 'REVISION_CONFLICT') {
+          const remote: DriveItem = (await this.api.request(`/v1/drive/items/${known.itemId}`)).item;
+          if (remote.revision > known.revision) {
+            this.journal.putFile({ ...known, revision: remote.revision });
+            this.abandonUpload(job);
+          }
+        }
+        throw e;
+      }
+      if (e instanceof ApiError && ['REVISION_CONFLICT', 'NAME_CONFLICT'].includes(e.code)) {
+        this.journal.abandonUpload(state.uploadId);
+        if (job.payload.relayVersion) return;
+        const conflict = path.posix.join(
+          path.posix.dirname(job.relativePath),
+          conflictName(path.basename(absolute), this.deviceName(), job.id),
+        );
+        await rename(absolute, contained(root.localPath, conflict));
+        this.conflict(root, job.relativePath, conflict);
+        this.journal.enqueue(root.id, conflict, 'upsert');
+        const remote = known
+          ? (await this.api.request(`/v1/drive/items/${known.itemId}`)).item
+          : await this.child(parentId, path.basename(absolute));
+        if (remote) await this.remoteItem(root, remote);
+        return;
+      }
+      throw e;
+    }
+    if (root.mode === 'backup') {
+      job.payload.backupEntry = {
+        relativePath: job.relativePath,
+        itemId: item.id,
+        versionId: item.currentVersionId,
+        sizeBytes: item.sizeBytes,
+        modifiedAt: modifiedAt({ mtimeMs: state.mtime! }),
+        savedAt: new Date().toISOString(),
+      };
+      this.journal.saveJob(job);
+    }
+    this.journal.putFile({
+      rootId: root.id,
+      relativePath: job.relativePath,
+      itemId: item.id,
+      revision: item.revision,
+      hash: state.hash!,
+      type: 'FILE',
+      sizeBytes: state.size,
+      mtimeMs: state.mtime,
+    });
+    this.receipts.queue(root, job.relativePath, item, state.hash!);
+    this.activity(root, job.relativePath, 'upload', item);
+  }
+  private async lookup(id: string): Promise<DriveItem> {
+    const known = this.feedItems?.get(id);
+    if (known) return known;
+    const { item } = await this.api.request(`/v1/drive/items/${id}`);
+    this.feedItems?.set(id, item);
+    return item;
+  }
+  private async relative(root: Root, item: DriveItem): Promise<string | null> {
+    const chain = [item];
+    let parentId = item.parentId;
+    let depth = 0;
+    while (parentId !== root.remoteId) {
+      if (!parentId || depth++ > 32) return null;
+      const parent = await this.lookup(parentId);
+      chain.unshift(parent);
+      parentId = parent.parentId;
+    }
+    let relative = '';
+    for (const entry of chain) {
+      const segment = this.localName(root, entry, relative);
+      relative = relative ? `${relative}/${segment}` : segment;
+    }
+    return relative;
+  }
+  /** An item already synced under the name earlier versions gave it keeps that local name. */
+  private localName(root: Root, item: DriveItem, parentPath: string) {
+    const segment = safeSegment(item.name, item.id);
+    const legacy = legacySafeSegment(item.name, item.id);
+    if (legacy === segment) return segment;
+    const known = this.journal.fileByItem(root.id, item.id);
+    return known?.relativePath === (parentPath ? `${parentPath}/${legacy}` : legacy)
+      ? legacy
+      : segment;
+  }
+  private async preserve(root: Root, relative: string, knownHash: string | null) {
+    const full = contained(root.localPath, relative);
+    try {
+      const info = await lstat(full);
+      if (info.isFile() && (await hashFile(full)) !== knownHash) {
+        const conflict = path.posix.join(
+          path.posix.dirname(relative),
+          conflictName(path.basename(full), this.deviceName(), crypto.randomUUID()),
+        );
+        await rename(full, contained(root.localPath, conflict));
+        this.conflict(root, relative, conflict);
+        this.journal.enqueue(root.id, conflict, 'upsert');
+        return true;
+      }
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code !== 'ENOENT') throw e;
+    }
+    return false;
+  }
+  /**
+   * A local rename or move arrives as a deletion plus a new file, in either order. When both are
+   * queued and the new file holds the deleted one's content, the cloud item is moved instead:
+   * nothing is uploaded again, and the cloud copy never leaves, even when storage is full.
+   */
+  private async renamedTo(root: Root, known: LocalFile) {
+    for (const other of this.journal.jobsOfKind(root.id, 'upsert'))
+      if (
+        // A file seen at a different size cannot hold the same content; skip reading it.
+        (other.payload.entry?.sizeBytes ?? known.sizeBytes) === known.sizeBytes &&
+        !this.journal.file(root.id, other.relativePath) &&
+        (await this.sameContent(root, other.relativePath, known)) &&
+        (await this.moveRemote(root, known, other.relativePath))
+      ) {
+        this.journal.drop(other.id);
+        return true;
+      }
+    return false;
+  }
+  private async renamedFrom(root: Root, relative: string) {
+    for (const other of this.journal.jobsOfKind(root.id, 'delete')) {
+      const known = this.journal.file(root.id, other.relativePath);
+      if (known?.type !== 'FILE' || (await this.exists(root, other.relativePath))) continue;
+      if (
+        (await this.sameContent(root, relative, known)) &&
+        (await this.moveRemote(root, known, relative))
+      ) {
+        this.journal.finish(other.id);
+        return true;
+      }
+    }
+    return false;
+  }
+  private async exists(root: Root, relative: string) {
+    try {
+      await lstat(contained(root.localPath, relative));
+      return true;
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code !== 'ENOENT') throw e;
+      return false;
+    }
+  }
+  /** Only files of the recorded size are hashed; an unreadable one is simply not a match. */
+  private async sameContent(root: Root, relative: string, known: LocalFile) {
+    if (!known.hash || known.sizeBytes === undefined) return false;
+    const full = contained(root.localPath, relative);
+    try {
+      const info = await lstat(full);
+      if (!info.isFile() || info.size !== known.sizeBytes) return false;
+      return (await hashFile(full)) === known.hash;
+    } catch {
+      return false;
+    }
+  }
+  /**
+   * A path that differs from a synced item's only in capitalization. macOS and Windows disks
+   * resolve both spellings to the same item, and the cloud treats both names as one, so uploading
+   * it as a new item would collide with the old. The folder listing tells the cases apart:
+   * - only the new spelling is listed: the item was renamed, so its cloud item is renamed too
+   *   (an edit made at the same time then syncs as a normal change of that item);
+   * - only the old one is listed: the path is another spelling of the synced item, as reported by
+   *   the watcher after a rename, and there is nothing to upload;
+   * - both are listed: two distinct items on a case-sensitive disk.
+   */
+  private async recapitalized(
+    root: Root,
+    relative: string,
+    type: 'FILE' | 'FOLDER',
+  ): Promise<'renamed' | 'alias' | false> {
+    const directory = path.posix.dirname(relative);
+    const name = path.posix.basename(relative);
+    const fold = (value: string) => value.normalize('NFC').toLowerCase();
+    const previous = this.journal
+      .files(root.id)
+      .find(
+        (file) =>
+          file.type === type &&
+          file.relativePath !== relative &&
+          path.posix.dirname(file.relativePath) === directory &&
+          fold(path.posix.basename(file.relativePath)) === fold(name),
+      );
+    if (!previous) return false;
+    const parent = directory === '.' ? root.localPath : contained(root.localPath, directory);
+    const listed = await readdir(parent);
+    const current = listed.includes(name);
+    const old = listed.includes(path.posix.basename(previous.relativePath));
+    if (current && !old) return (await this.moveRemote(root, previous, relative)) && 'renamed';
+    if (old && !current) return 'alias';
+    return false;
+  }
+  /**
+   * On a case-sensitive disk the old spelling of a recapitalized item, or of anything inside a
+   * recapitalized folder, is reported deleted, possibly before the new spelling is reported. When
+   * the path still exists with different capitalization, the synced item (or folder) whose name
+   * changed is renamed in the cloud instead of deleted.
+   */
+  private async recapitalizedAway(root: Root, relative: string) {
+    if (root.mode !== 'sync') return false;
+    const fold = (value: string) => value.normalize('NFC').toLowerCase();
+    const segments = relative.split('/');
+    const actual: string[] = [];
+    for (const segment of segments) {
+      const parent = actual.length ? contained(root.localPath, actual.join('/')) : root.localPath;
+      let listed: string[];
+      try {
+        listed = await readdir(parent);
+      } catch {
+        return false;
+      }
+      if (listed.includes(segment)) {
+        actual.push(segment);
+        continue;
+      }
+      const matches = listed.filter((name) => fold(name) === fold(segment));
+      if (matches.length !== 1) return false;
+      // The first segment whose spelling changed is the item that was renamed.
+      const from = [...actual, segment].join('/');
+      const to = [...actual, matches[0]].join('/');
+      const known = this.journal.file(root.id, from);
+      if (!known || this.journal.file(root.id, to)) return false;
+      return this.moveRemote(root, known, to);
+    }
+    return false;
+  }
+  /** Records a folder's synced contents under its new local path. */
+  private moveChildren(root: Root, from: string, to: string) {
+    for (const child of this.journal
+      .files(root.id)
+      .filter((f) => f.relativePath.startsWith(from + '/'))) {
+      this.journal.deleteFile(root.id, child.relativePath);
+      this.journal.putFile({ ...child, relativePath: to + child.relativePath.slice(from.length) });
+    }
+  }
+  /** Moves and renames `known`'s cloud item to `relative`; false when the cloud refuses. */
+  private async moveRemote(root: Root, known: LocalFile, relative: string) {
+    const info = await lstat(contained(root.localPath, relative));
+    const oldDir = path.posix.dirname(known.relativePath);
+    const oldParent = oldDir === '.' ? root.remoteId : this.journal.file(root.id, oldDir)?.itemId;
+    const name = path.posix.basename(relative);
+    let item: DriveItem | undefined;
+    let revision = known.revision;
+    try {
+      const parentId = await this.remoteParent(root, relative);
+      if (parentId !== oldParent) {
+        item = (
+          await this.api.request(`/v1/drive/items/${known.itemId}/move`, {
+            method: 'POST',
+            body: { operationId: crypto.randomUUID(), baseRevision: revision, parentId },
+          })
+        ).item;
+        revision = item!.revision;
+      }
+      if (name !== path.posix.basename(known.relativePath))
+        item = (
+          await this.api.request(`/v1/drive/items/${known.itemId}`, {
+            method: 'PATCH',
+            body: { operationId: crypto.randomUUID(), baseRevision: revision, name },
+          })
+        ).item;
+    } catch (e) {
+      // Changed elsewhere, or the destination is taken: sync the two changes separately.
+      if (e instanceof ApiError && e.status >= 400 && e.status < 500) return false;
+      throw e;
+    }
+    if (!item) return false;
+    this.journal.deleteFile(root.id, known.relativePath);
+    this.journal.putFile({
+      ...known,
+      relativePath: relative,
+      revision: item.revision,
+      ...(known.type === 'FILE' && { sizeBytes: info.size, mtimeMs: info.mtimeMs }),
+    });
+    if (known.type === 'FOLDER') this.moveChildren(root, known.relativePath, relative);
+    this.receipts.queue(root, relative, item, known.hash);
+    this.activity(root, relative, 'upload', item);
+    return true;
+  }
+  /**
+   * Deletes what under a remotely deleted folder is exactly as last synced: unchanged files, then
+   * folders left holding only file-manager metadata. Edited or unknown files stay.
+   */
+  private async removeSynced(root: Root, folder: string) {
+    const pending = new Set(
+      this.journal
+        .jobs()
+        .filter((job) => job.rootId === root.id && job.kind === 'upsert')
+        .map((job) => job.relativePath),
+    );
+    const entries = this.journal
+      .files(root.id)
+      .filter((f) => f.relativePath.startsWith(folder + '/') && !pending.has(f.relativePath))
+      .sort((a, b) => b.relativePath.length - a.relativePath.length);
+    for (const entry of entries) {
+      const full = contained(root.localPath, entry.relativePath);
+      try {
+        if (entry.type === 'FILE') {
+          if (
+            (await this.matchesDisk(root, entry)) ||
+            ((await lstat(full)).isFile() && (await hashFile(full)) === entry.hash)
+          )
+            await rm(full, { force: true });
+        } else if ((await readdir(full)).every(metadataSegment))
+          await rm(full, { recursive: true });
+      } catch (e) {
+        if ((e as NodeJS.ErrnoException).code !== 'ENOENT') throw e;
+      }
+    }
+  }
+  /** The journal's copy is still the one on disk: same size and time, or a folder present. */
+  private async matchesDisk(root: Root, known: LocalFile) {
+    try {
+      const info = await lstat(contained(root.localPath, known.relativePath));
+      return known.type === 'FOLDER'
+        ? info.isDirectory()
+        : info.isFile() && info.size === known.sizeBytes && info.mtimeMs === known.mtimeMs;
+    } catch {
+      return false;
+    }
+  }
+  /** `listedPath`: the item came from a fresh listing at this path, so it need not be fetched. */
+  /** Removes a synced item's local copy, keeping local edits the cloud has not seen. */
+  private async removeLocal(root: Root, known: LocalFile) {
+    const full = contained(root.localPath, known.relativePath);
+    if (known.type === 'FILE') {
+      await this.preserve(root, known.relativePath, known.hash);
+      await rm(full, { force: true });
+    } else {
+      // Files the cloud already has go with the folder; anything else (unsynced work) is kept
+      // in a copy beside the old location, which is excluded from further syncing.
+      try {
+        await this.removeSynced(root, known.relativePath);
+        if ((await readdir(full)).every(metadataSegment)) await rm(full, { recursive: true });
+        else {
+          const kept = path.posix.join(
+            path.posix.dirname(known.relativePath),
+            recoveredName(path.basename(full), new Date()),
+          );
+          await rename(full, contained(root.localPath, kept));
+          this.recovered(root, known.relativePath, kept);
+        }
+      } catch (e) {
+        if ((e as NodeJS.ErrnoException).code !== 'ENOENT') throw e;
+      }
+      for (const child of this.journal
+        .files(root.id)
+        .filter((f) => f.relativePath.startsWith(known.relativePath + '/')))
+        this.journal.deleteFile(root.id, child.relativePath);
+    }
+    this.journal.deleteFile(root.id, known.relativePath);
+  }
+  async remoteItem(root: Root, eventItem: DriveItem, listedPath?: string) {
+    if (this.stopped || this.state.paused || root.paused || root.mode !== 'sync') return;
+    if (root.remoteId === eventItem.id) {
+      if (!eventItem.deletedAt) this.receipts.queue(root, '.', eventItem, null);
+      return;
+    }
+    const known = this.journal.fileByItem(root.id, eventItem.id);
+    if (known && this.ignored(root, known.relativePath)) return;
+    if (eventItem.deletedAt && known && known.revision >= eventItem.revision) return;
+    // A revision this computer already has, such as a file it just uploaded coming back in the
+    // feed: renames, moves and new versions all raise the revision, so nothing has changed.
+    // A folder walk (listedPath) still looks at every item, to repair copies that went astray.
+    if (
+      listedPath === undefined &&
+      !eventItem.deletedAt &&
+      known?.type === eventItem.type &&
+      eventItem.revision <= known.revision
+    )
+      return;
+    if (eventItem.deletedAt) {
+      this.waiting.delete(eventItem.id);
+      if (known) await this.removeLocal(root, known);
+      return;
+    }
+    // Resolve the latest metadata when processing historical feed entries.
+    let item: DriveItem = eventItem;
+    if (listedPath === undefined)
+      try {
+        item = await this.lookup(eventItem.id);
+      } catch (e) {
+        // A folder removed from sync (or one inside it) keeps its local copy; its feed entries
+        // are skipped so the feed goes on. SYNC_FOLDER_REMOVED handles one inside this root.
+        if (
+          e instanceof ApiError &&
+          ['ITEM_NOT_FOUND', 'PARENT_NOT_FOUND', 'SYNC_REMOVED'].includes(e.code)
+        )
+          return;
+        throw e;
+      }
+    const relative = listedPath ?? (await this.relative(root, item));
+    if (relative === null) {
+      // Moved out of this sync folder: its local copy goes, as if the item had been deleted.
+      this.waiting.delete(item.id);
+      if (known) await this.removeLocal(root, known);
+      return;
+    }
+    if (this.ignored(root, relative)) return;
+    // Unchanged in the cloud since it was synced, yet gone from this computer: it was deleted,
+    // moved or renamed here, and that change is about to sync. Bringing it back would undo it.
+    if (
+      known?.relativePath === relative &&
+      item.revision <= known.revision &&
+      !(await this.exists(root, relative))
+    )
+      return;
+    const destination = await safeParents(root.localPath, relative);
+    if (known && known.relativePath !== relative) {
+      const previous = contained(root.localPath, known.relativePath);
+      const blocking = await lstat(destination).catch((e) => {
+        if ((e as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
+        throw e;
+      });
+      // A capitalization change: macOS and Windows disks resolve the new name to the item itself.
+      const itself =
+        blocking &&
+        (await lstat(previous).then(
+          (own) => own.dev === blocking.dev && own.ino === blocking.ino,
+          () => false,
+        ));
+      if (blocking && !itself)
+        throw new Error('A local item blocks a remote move. Move it aside to continue safely.');
+      try {
+        await rename(previous, destination);
+      } catch (e) {
+        if ((e as NodeJS.ErrnoException).code !== 'ENOENT') throw e;
+      }
+      this.journal.deleteFile(root.id, known.relativePath);
+      if (known.type === 'FOLDER') this.moveChildren(root, known.relativePath, relative);
+    }
+    if (item.type === 'FOLDER') {
+      await mkdir(destination, { recursive: true });
+      this.journal.putFile({
+        rootId: root.id,
+        relativePath: relative,
+        itemId: item.id,
+        revision: item.revision,
+        hash: null,
+        type: 'FOLDER',
+      });
+      this.receipts.queue(root, relative, item, null);
+      return;
+    }
+    // A new file skips the version lookup: the download is verified against its own hash.
+    let localHash: string | null = null;
+    try {
+      localHash = await hashFile(destination);
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code !== 'ENOENT') throw e;
+    }
+    if (localHash) {
+      const versions = await this.api.request(`/v1/drive/items/${item.id}/versions`);
+      const hash = versions.items.find((v: any) => v.id === item.currentVersionId)?.contentHash;
+      if (!hash) throw new Error('File version is unavailable.');
+      if (localHash === hash) {
+        this.journal.putFile({
+          rootId: root.id,
+          relativePath: relative,
+          itemId: item.id,
+          revision: item.revision,
+          hash,
+          type: 'FILE',
+          ...(await localStat(destination)),
+        });
+        this.receipts.queue(root, relative, item, hash);
+        this.waiting.delete(item.id);
+        if (item.cloudState === 'REQUESTED') {
+          this.journal.enqueue(root.id, relative, 'upsert');
+          const relay = this.journal.pendingJob(root.id, relative, 'upsert')!;
+          if (relay.payload.relayVersion !== item.currentVersionId) {
+            relay.payload.relayVersion = item.currentVersionId;
+            this.journal.abandonUpload(relay.payload.upload?.uploadId);
+            relay.payload.upload = { operationId: crypto.randomUUID() };
+          }
+          this.journal.saveJob(relay);
+          this.scheduleTick();
+        }
+        return;
+      }
+    }
+    if (item.cloudState === 'RELEASED' || item.cloudState === 'REQUESTED') {
+      await this.api.request(`/v1/sync/items/${item.id}/request-content`, { method: 'POST' });
+      this.state.message = 'Waiting for a linked device to provide this file';
+      this.waiting.set(item.id, { rootId: root.id, relativePath: relative });
+      this.emit();
+      return;
+    }
+    this.state.active = {
+      rootId: root.id,
+      direction: 'download',
+      relativePath: relative,
+      loaded: 0,
+      total: item.sizeBytes,
+    };
+    this.emit();
+    const hash = await downloadFile(
+      this.api,
+      { driveItemId: item.id, versionId: item.currentVersionId! },
+      destination,
+      (loaded, total) => {
+        this.state.active = {
+          rootId: root.id,
+          direction: 'download',
+          relativePath: relative,
+          loaded,
+          total,
+        };
+        this.emit(loaded < total);
+      },
+      async () => {
+        await this.preserve(root, relative, known?.hash ?? null);
+      },
+    );
+    this.journal.putFile({
+      rootId: root.id,
+      relativePath: relative,
+      itemId: item.id,
+      revision: item.revision,
+      hash,
+      type: 'FILE',
+      ...(await localStat(destination)),
+    });
+    this.receipts.queue(root, relative, item, hash);
+    this.waiting.delete(item.id);
+    this.activity(root, relative, 'download', item);
+  }
+}

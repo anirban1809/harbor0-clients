@@ -1,0 +1,73 @@
+import js from '@eslint/js';
+import ts from 'typescript-eslint';
+export default ts.config(
+  {
+    ignores: [
+      '**/node_modules/**',
+      '**/dist/**',
+      '**/.next/**',
+      'cdk.out/**',
+      '.cloud/**',
+      'packages/api-client/src/generated.ts',
+      'apps/web/next-env.d.ts',
+      // The linked backend checkout (scripts/backend.ts) is linted in its own repository.
+      'backend/**',
+      'apps/backend/**',
+      // Generated one-off session outputs, not project code.
+      'outputs/**',
+      // The mobile apps' local build output (Gradle reports, Xcode products).
+      'apps/android/**/build/**',
+      'apps/ios/build/**',
+      'apps/ios/build-device/**',
+    ],
+  },
+  js.configs.recommended,
+  ...ts.configs.recommended,
+  {
+    files: ['**/*.{ts,tsx,js}'],
+    languageOptions: {
+      globals: {
+        console: 'readonly',
+        process: 'readonly',
+        Buffer: 'readonly',
+        URL: 'readonly',
+        fetch: 'readonly',
+        crypto: 'readonly',
+        setTimeout: 'readonly',
+        setInterval: 'readonly',
+        clearInterval: 'readonly',
+        window: 'readonly',
+        document: 'readonly',
+        navigator: 'readonly',
+        localStorage: 'readonly',
+        File: 'readonly',
+        Blob: 'readonly',
+        Worker: 'readonly',
+        AbortController: 'readonly',
+        AbortSignal: 'readonly',
+        DOMException: 'readonly',
+        Response: 'readonly',
+        Request: 'readonly',
+        Headers: 'readonly',
+        FormData: 'readonly',
+        TextEncoder: 'readonly',
+        Uint8Array: 'readonly',
+        Event: 'readonly',
+        MessageEvent: 'readonly',
+        performance: 'readonly',
+        globalThis: 'readonly',
+        __dirname: 'readonly',
+        require: 'readonly',
+      },
+    },
+    rules: {
+      'no-control-regex': 'off',
+      '@typescript-eslint/no-explicit-any': 'off',
+      '@typescript-eslint/no-unused-vars': [
+        'error',
+        { argsIgnorePattern: '^_', varsIgnorePattern: '^_', caughtErrorsIgnorePattern: '^_' },
+      ],
+      'no-empty': ['error', { allowEmptyCatch: true }],
+    },
+  },
+);

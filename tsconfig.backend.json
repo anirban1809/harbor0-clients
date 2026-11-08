@@ -1,0 +1,21 @@
+{
+  "//": "Files that import the backend's sources from apps/backend (a link to harbor0-src, see scripts/backend.ts). `npm run typecheck` checks them only when the link exists.",
+  "extends": "./tsconfig.json",
+  "include": [
+    "apps/desktop/test/shared-sync.test.ts",
+    "apps/desktop/test/backup-drives.test.ts",
+    "apps/desktop/test/device-key.test.ts",
+    "apps/desktop/test/two-computers.ts",
+    "apps/desktop/test/backup-storage.test.ts",
+    "apps/desktop/test/sync-storage.test.ts",
+    "apps/desktop/test/backup-case-names.test.ts",
+    "apps/desktop/test/backup-integration.test.ts",
+    "apps/desktop/test/sync-two-computers.test.ts",
+    "scripts/desktop-e2ee-check.ts",
+    "scripts/validate-shared-sync-live.ts",
+    "apps/desktop/test/sync-batch.test.ts",
+    "apps/desktop/test/sync-feed.test.ts",
+    "apps/desktop/test/sync-detach-names.test.ts"
+  ],
+  "exclude": ["node_modules", "dist"]
+}

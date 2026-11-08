@@ -1,0 +1,13 @@
+/* One stylesheet for the web and desktop apps: tokens, element defaults,
+   the component kit, the app frame, page layouts, then the phone layout. */
+@import '@fontsource-variable/geist';
+@import '@fontsource-variable/geist-mono';
+@import './styles/tokens.css';
+@import './styles/base.css';
+@import './styles/components.css';
+@import './styles/layout.css';
+@import './styles/pages.css';
+@import './styles/upload-tray.css';
+@import './styles/file-preview.css';
+@import './styles/e2ee.css';
+@import './styles/mobile.css';

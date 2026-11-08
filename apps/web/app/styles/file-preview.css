@@ -1,0 +1,131 @@
+/* File previews: the preview tray and PDF viewer, shared by the apps and public link pages. */
+.file-preview-tray {
+  width: min(480px, calc(100vw - 16px));
+}
+.file-preview-body {
+  min-width: 0;
+  overflow: hidden;
+}
+.file-preview-image,
+.file-preview-video {
+  max-height: 58dvh;
+  margin: 0 auto;
+  border-radius: var(--radius);
+  object-fit: contain;
+}
+.file-preview-video {
+  width: 100%;
+  background: #000;
+}
+.file-preview-text {
+  max-height: 55dvh;
+  margin: 0;
+  padding: 12px;
+  overflow: auto;
+  border-radius: var(--radius);
+  background: var(--fill-1);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  line-height: 1.6;
+  tab-size: 4;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.file-preview-message,
+.file-preview-audio {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  min-height: 180px;
+  padding: 24px 16px;
+  border-radius: var(--radius);
+  background: var(--fill-1);
+  color: var(--text-2);
+  font-size: var(--text-sm);
+  text-align: center;
+}
+.file-preview-audio audio {
+  width: 100%;
+}
+.file-preview-loading {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 16px;
+  color: var(--text-2);
+  font-size: var(--text-sm);
+}
+.file-preview-notice {
+  margin-bottom: 8px;
+  color: var(--text-2);
+  font-size: var(--text-xs);
+}
+.file-preview-info {
+  margin-top: 24px;
+}
+.file-preview-info h3 {
+  margin-bottom: 12px;
+}
+
+/* PDF viewer */
+.file-preview-pdf {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.file-preview-pdf-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  color: var(--text-2);
+  font-size: var(--text-xs);
+}
+.file-preview-pdf-zoom {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+.file-preview-pdf-level {
+  min-width: 44px;
+  padding: 2px 4px;
+  border: 0;
+  border-radius: var(--radius);
+  background: none;
+  color: inherit;
+  font: inherit;
+  font-variant-numeric: tabular-nums;
+  cursor: pointer;
+}
+.file-preview-pdf-level:hover {
+  background: var(--fill-1);
+}
+.file-preview-pdf-pages {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 8px;
+  max-height: 58dvh;
+  padding: 8px;
+  overflow: auto;
+  border-radius: var(--radius);
+  background: var(--fill-1);
+}
+.file-preview-pdf-page {
+  flex: none;
+  margin: 0 auto;
+  background: #fff;
+  box-shadow: 0 1px 3px rgb(0 0 0 / 0.15);
+}
+.file-preview-pdf-placeholder {
+  width: 100%;
+  aspect-ratio: 1 / 1.4142;
+  animation: pulse 1.8s ease-in-out infinite;
+}
+.file-preview-pdf-page canvas {
+  display: block;
+  width: 100%;
+  height: 100%;
+}

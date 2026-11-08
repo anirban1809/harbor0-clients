@@ -1,0 +1,46 @@
+name: Deploy staging
+# Manual only: run it from the Actions tab (or `gh workflow run deploy-staging.yml --ref staging`).
+# Deploy the backend to staging from anirban1809/harbor0-src first.
+on:
+  workflow_dispatch:
+# One staging deploy at a time; a second run waits rather than racing the stack update.
+concurrency:
+  group: deploy-staging
+  cancel-in-progress: false
+permissions:
+  contents: read
+  id-token: write
+jobs:
+  deploy:
+    # The AWS role only trusts this branch; the guard also stops a run started from another ref.
+    if: github.ref == 'refs/heads/staging' && vars.STAGING_AWS_ROLE_ARN != ''
+    runs-on: ubuntu-latest
+    env:
+      HARBOR_ENV: staging
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: npm run lint
+      - run: npm run typecheck
+      - run: npm test
+      - run: npx playwright install --with-deps chromium
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.STAGING_AWS_ROLE_ARN }}
+          aws-region: ${{ vars.STAGING_AWS_REGION || 'us-east-1' }}
+      - name: Write .env.staging
+        env:
+          AWS_REGION: ${{ vars.STAGING_AWS_REGION || 'us-east-1' }}
+          WEB_ORIGIN: ${{ vars.STAGING_WEB_ORIGIN }}
+          WEB_DOMAIN: ${{ vars.STAGING_WEB_DOMAIN }}
+          WEB_CERT_ARN: ${{ vars.STAGING_WEB_CERT_ARN }}
+        run: |
+          umask 077
+          for name in HARBOR_ENV AWS_REGION WEB_ORIGIN WEB_DOMAIN WEB_CERT_ARN; do
+            printf '%s=%s\n' "$name" "${!name}"
+          done > .env.staging
+      - run: npm run staging:deploy-web
