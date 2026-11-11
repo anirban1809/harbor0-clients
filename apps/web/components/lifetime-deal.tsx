@@ -84,14 +84,14 @@ export function LifetimeCard({ api }: { api: ApiClient }) {
       title="Lifetime storage"
       description={
         owned
-          ? `You have lifetime seat #${owned.seat}: ${owned.terabytes} TB, bought ${day(owned.purchasedAt)}.`
+          ? `You have a lifetime seat: ${owned.terabytes} TB, bought ${day(owned.purchasedAt)}.`
           : offer.data.soldOut
             ? 'Lifetime seats are sold out.'
             : `Pay once and keep the storage for as long as harbor0 runs. From ${money(from.amount, offer.data.currency)} for ${from.terabytes} TB. ${seatsLine(offer.data)}`
       }
       action={
         owned ? (
-          <Badge tone="success">Seat #{owned.seat}</Badge>
+          <Badge tone="success">Active</Badge>
         ) : (
           !offer.data.soldOut &&
           offer.data.checkoutAvailable && (
@@ -220,8 +220,6 @@ export function LifetimeSeatCard({ seat }: { seat: LifetimeSeat }) {
       }
     >
       <dl className="details">
-        <dt>Seat</dt>
-        <dd>#{seat.seat}</dd>
         <dt>Storage</dt>
         <dd>{seat.terabytes} TB</dd>
         <dt>Bought</dt>
