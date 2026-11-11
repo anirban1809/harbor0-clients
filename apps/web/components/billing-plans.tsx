@@ -21,6 +21,8 @@ type Plan = {
 };
 type Subscription = {
   planId: string;
+  /** A lifetime seat, which adds to any plan. */
+  lifetime?: { seat: number; terabytes: number } | null;
   entitlement: { baseFreeBytes: number; paidBytes: number; totalQuotaBytes: number };
   subscription?: {
     interval: Interval;
@@ -42,11 +44,17 @@ export function useBillingSubscription(api: ApiClient, enabled = true) {
   });
 }
 
-/** The badge on the storage meter: "Free plan", "500 GB plan". */
-export const planLabel = (planId = 'free') =>
-  planId === 'free'
-    ? 'Free plan'
-    : `${planId.replace(/(\d+)(gb|tb)/i, (_, n, u) => `${n} ${u.toUpperCase()}`)} plan`;
+/** The badge on the storage meter: "Free plan", "500 GB plan", "500 GB plan + 2 TB lifetime". */
+export const planLabel = (planId = 'free', lifetime?: { terabytes: number } | null) => {
+  const plan =
+    planId === 'free'
+      ? 'Free plan'
+      : `${planId.replace(/(\d+)(gb|tb)/i, (_, n, u) => `${n} ${u.toUpperCase()}`)} plan`;
+  if (!lifetime) return plan;
+  return planId === 'free'
+    ? `${lifetime.terabytes} TB lifetime`
+    : `${plan} + ${lifetime.terabytes} TB lifetime`;
+};
 
 /**
  * Paid plans on the Storage page. Arriving with `?plan=500gb&interval=year` (the website's

@@ -14,6 +14,7 @@ import {
 import { PaymentMethods } from './billing-cards';
 import { BillingDetails } from './billing-details';
 import { CancelPlanDialog, ChangePlanDialog } from './billing-plan-dialogs';
+import { LifetimeSeatCard } from './lifetime-deal';
 import { LoadError } from './empty-state';
 import { ContentSkeleton } from './loading-states';
 import { Alert } from './ui/alert';
@@ -131,7 +132,9 @@ export function BillingSettings({
     paymentMethods = [],
     changes = [],
     available,
+    lifetime,
   } = account.data;
+  const seat = lifetime && !lifetime.refundedAt ? lifetime : undefined;
   const live = sub && sub.status !== 'canceled' && !sub.endedAt;
   // A change waiting for renewal sets what the next payment is.
   const pendingOption = sub?.pendingChange
@@ -152,15 +155,22 @@ export function BillingSettings({
         </Alert>
       )}
       {error && <Alert tone="error">{error}</Alert>}
+      {lifetime && <LifetimeSeatCard seat={lifetime} />}
       <Card
         className="panel billing-plan"
-        title={live ? `${sub.name} plan` : 'Free plan'}
+        title={live ? `${sub.name} plan` : seat ? 'Plan' : 'Free plan'}
         description={
           live
             ? `${money(sub.amount, sub.currency)} per ${per}, plus any sales tax or VAT.`
-            : `${freeStorage} of storage with every feature included.`
+            : seat
+              ? `No plan. A plan’s storage adds to your ${seat.terabytes} TB lifetime seat.`
+              : `${freeStorage} of storage with every feature included.`
         }
-        action={<Badge tone={live ? statusTone : 'accent'}>{live ? statusLabel : 'Free'}</Badge>}
+        action={
+          <Badge tone={live ? statusTone : 'accent'}>
+            {live ? statusLabel : seat ? 'None' : 'Free'}
+          </Badge>
+        }
       >
         {live && sub.status === 'past_due' && (
           <Alert tone="error">
@@ -213,7 +223,7 @@ export function BillingSettings({
             <dt>{sub.cancelAtPeriodEnd ? 'Plan ends' : 'Next payment'}</dt>
             <dd>
               {sub.cancelAtPeriodEnd
-                ? `${day(sub.currentPeriodEnd)} — it won’t renew, and your storage returns to ${freeStorage}.`
+                ? `${day(sub.currentPeriodEnd)} — it won’t renew, and your storage returns to ${seat ? `your ${seat.terabytes} TB lifetime seat` : freeStorage}.`
                 : `${day(sub.currentPeriodEnd)} · ${money(nextAmount, sub.currency)} plus tax${sub.pendingChange ? ` for ${sub.pendingChange.name}` : ''}`}
             </dd>
             <dt>Customer since</dt>

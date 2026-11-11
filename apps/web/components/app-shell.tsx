@@ -82,6 +82,7 @@ import { AccessTokenSettings } from '../components/access-token-settings';
 import { MigrationSettings } from '../components/migration-settings';
 import { EmailSettings } from '../components/email-settings';
 import { BillingPlans, planLabel, useBillingSubscription } from '../components/billing-plans';
+import { LifetimeCard } from '../components/lifetime-deal';
 import { BillingSettings } from '../components/billing-settings';
 import { SettingsTabs, type SettingsTab } from './settings-tabs';
 import { useAccountAppearance } from '../lib/appearance';
@@ -1342,9 +1343,10 @@ function Workspace() {
         </nav>
         <div className="sidebar-bottom">
           <FolderActivityStatus activity={folderActivity} onOpen={openActivity} />
-          {billingOn && billing.data?.planId === 'free' && section !== 'Storage' && (
-            <UpgradeBanner onUpgrade={() => navigate('Storage')} />
-          )}
+          {billingOn &&
+            billing.data?.planId === 'free' &&
+            !billing.data.lifetime &&
+            section !== 'Storage' && <UpgradeBanner onUpgrade={() => navigate('Storage')} />}
           <StorageIndicator
             storage={usage}
             onManage={() => navigate('Storage')}
@@ -2049,7 +2051,9 @@ function Workspace() {
           {section === 'Storage' && !searching && (
             <div className="storage-page">
               <Card className="panel capacity">
-                <Badge tone="accent">{planLabel(billing.data?.planId)}</Badge>
+                <Badge tone="accent">
+                  {planLabel(billing.data?.planId, billing.data?.lifetime)}
+                </Badge>
                 <p className="storage-amount">
                   <strong>{bytes(usage.usedBytes)}</strong>
                   <span>of {bytes(usage.quotaBytes)} used</span>
@@ -2070,6 +2074,7 @@ function Workspace() {
                 </p>
               </Card>
               <StorageAudit api={api} />
+              <LifetimeCard api={api} />
               {billingOn ? (
                 <BillingPlans api={api} />
               ) : (

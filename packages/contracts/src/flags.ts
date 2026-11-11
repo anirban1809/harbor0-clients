@@ -84,6 +84,13 @@ export const featureFlags = {
     description:
       'Paid plans on the web: checkout, Settings → Billing, cards and invoices. Paid plans keep working if the flag goes off.',
   },
+  'lifetime-deal': {
+    description:
+      'Lifetime seats on the Storage page: 1–5 TB for one payment, 50 seats. Seats already bought keep their storage if the flag goes off.',
+    usage: {
+      CHECKOUT_STARTED: 'Opened lifetime checkout',
+    },
+  },
 } as const satisfies Record<string, FlagDefinition>;
 type FlagDefinition = {
   /** What staff see for it in the console. */

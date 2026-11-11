@@ -2033,3 +2033,12 @@
   padding-left: 18px;
   font-size: var(--text-sm);
 }
+
+.lifetime-terms {
+  margin: 0;
+  padding-left: 18px;
+  display: grid;
+  gap: 4px;
+  font-size: var(--text-sm);
+  line-height: 1.5;
+}

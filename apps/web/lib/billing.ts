@@ -68,9 +68,18 @@ export type PlanOption = {
   estimate: number | null;
   reason: string | null;
 };
+/** A lifetime seat: storage paid for once. */
+export type LifetimeSeat = {
+  seat: number;
+  terabytes: number;
+  storageBytes: number;
+  purchasedAt: string;
+  refundedAt: string | null;
+};
 export type BillingAccount = {
   available: boolean;
   subscription: Subscription | null;
+  lifetime?: LifetimeSeat | null;
   customer: {
     name: string | null;
     email: string;
