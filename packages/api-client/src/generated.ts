@@ -38522,11 +38522,17 @@ export interface operations {
                             name: string;
                             storageBytes: number;
                             priceMinorUnits: number;
+                            salePriceMinorUnits: number | null;
                             currency: string;
                             /** @enum {string} */
                             billingPeriod: "MONTH" | "YEAR";
                         }[];
                         checkoutAvailable: boolean;
+                        sale: {
+                            percent: number;
+                            months: number;
+                            endsAt: string;
+                        } | null;
                     };
                 };
             };

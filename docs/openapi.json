@@ -87162,6 +87162,12 @@
                           "priceMinorUnits": {
                             "type": "number"
                           },
+                          "salePriceMinorUnits": {
+                            "type": [
+                              "number",
+                              "null"
+                            ]
+                          },
                           "currency": {
                             "type": "string"
                           },
@@ -87178,6 +87184,7 @@
                           "name",
                           "storageBytes",
                           "priceMinorUnits",
+                          "salePriceMinorUnits",
                           "currency",
                           "billingPeriod"
                         ]
@@ -87185,11 +87192,38 @@
                     },
                     "checkoutAvailable": {
                       "type": "boolean"
+                    },
+                    "sale": {
+                      "anyOf": [
+                        {
+                          "type": "object",
+                          "properties": {
+                            "percent": {
+                              "type": "number"
+                            },
+                            "months": {
+                              "type": "number"
+                            },
+                            "endsAt": {
+                              "type": "string"
+                            }
+                          },
+                          "required": [
+                            "percent",
+                            "months",
+                            "endsAt"
+                          ]
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
                     }
                   },
                   "required": [
                     "items",
-                    "checkoutAvailable"
+                    "checkoutAvailable",
+                    "sale"
                   ]
                 }
               }

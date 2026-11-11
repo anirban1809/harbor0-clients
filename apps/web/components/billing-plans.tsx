@@ -15,6 +15,8 @@ type Plan = {
   name: string;
   storageBytes: number;
   priceMinorUnits: number;
+  /** The first payment's price while a sale is on; the plan renews at priceMinorUnits. */
+  salePriceMinorUnits?: number | null;
   billingPeriod: 'MONTH' | 'YEAR';
   /** More than 1 when the plan stacks; the price is per block. */
   maxUnits?: number;
@@ -32,7 +34,16 @@ type Subscription = {
   };
 };
 
+type Sale = { percent: number; months: number; endsAt: string };
+
 const usd = new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' });
+/** The sale's last day: `endsAt` is when that day has ended everywhere, noon UTC the day after. */
+const lastDay = (endsAt: string) =>
+  new Date(Date.parse(endsAt) - 86_400_000).toLocaleDateString(undefined, {
+    day: 'numeric',
+    month: 'long',
+    timeZone: 'UTC',
+  });
 const day = (iso: string) =>
   new Date(iso).toLocaleDateString(undefined, { day: 'numeric', month: 'long', year: 'numeric' });
 
@@ -74,7 +85,11 @@ export function BillingPlans({ api }: { api: ApiClient }) {
   const plans = useQuery({
     queryKey: ['billing', 'plans'],
     queryFn: () =>
-      api.request('/v1/billing/plans') as Promise<{ items: Plan[]; checkoutAvailable: boolean }>,
+      api.request('/v1/billing/plans') as Promise<{
+        items: Plan[];
+        checkoutAvailable: boolean;
+        sale?: Sale | null;
+      }>,
   });
   const current = useBillingSubscription(api);
   const started = useRef(false);
@@ -136,6 +151,7 @@ export function BillingPlans({ api }: { api: ApiClient }) {
   );
   const active = current.data?.planId !== 'free' ? current.data : undefined;
   const sub = active?.subscription;
+  const sale = plans.data?.checkoutAvailable ? plans.data.sale : undefined;
 
   return (
     <Card
@@ -148,7 +164,9 @@ export function BillingPlans({ api }: { api: ApiClient }) {
             : sub.currentPeriodEnd
               ? `Renews ${sub.interval === 'year' ? 'yearly' : 'monthly'} on ${day(sub.currentPeriodEnd)}.`
               : undefined
-          : 'Every plan gets every feature. Plans differ only in storage.'
+          : sale
+            ? `Black Friday: ${sale.percent}% off ${interval === 'year' ? 'the first year' : `the first ${sale.months} months`}, until ${lastDay(sale.endsAt)}. Every plan gets every feature.`
+            : 'Every plan gets every feature. Plans differ only in storage.'
       }
       action={
         active ? (
@@ -180,7 +198,16 @@ export function BillingPlans({ api }: { api: ApiClient }) {
             <div className="plan-option" key={plan.id}>
               <strong>{plan.name}</strong>
               <span className="muted">
-                {usd.format(plan.priceMinorUnits / 100)} / {interval === 'year' ? 'year' : 'month'}
+                {plan.salePriceMinorUnits != null && (
+                  <>
+                    <s>{usd.format(plan.priceMinorUnits / 100)}</s>{' '}
+                    <strong className="plan-sale">
+                      {usd.format(plan.salePriceMinorUnits / 100)}
+                    </strong>{' '}
+                  </>
+                )}
+                {plan.salePriceMinorUnits == null && usd.format(plan.priceMinorUnits / 100)} /{' '}
+                {interval === 'year' ? 'year' : 'month'}
                 {(plan.maxUnits ?? 1) > 1 &&
                   ` · stacks up to ${plan.maxUnits} × (${((plan.storageBytes * plan.maxUnits!) / 1e12).toLocaleString()} TB)`}
               </span>

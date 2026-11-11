@@ -676,6 +676,11 @@
 .plan-option .muted {
   font-size: var(--text-sm);
 }
+/* Sale price beside the struck-through normal one. */
+.plan-option .plan-sale {
+  color: var(--text);
+  font-weight: 600;
+}
 
 /* Settings ---------------------------------------------------------------- */
 .billing-plan .settings-actions {
