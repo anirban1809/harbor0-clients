@@ -236,8 +236,6 @@ export function DriveWorkspace({
   const partial = useRef(false);
   const [loadError, setLoadError] = useState('');
   const [syncStatuses, setSyncStatuses] = useState<Record<string, SyncItemStatus>>({});
-  // The last successful status read, for the poller; null until one succeeds.
-  const settledStatuses = useRef<Record<string, SyncItemStatus> | null>(null);
   const [syncFoldersError, setSyncFoldersError] = useState(false);
   const [error, setError] = useState('');
   // Requests fail while the signed-out dialog is up; it explains the failure instead.
@@ -581,77 +579,49 @@ export function DriveWorkspace({
     pages,
     activeTab,
   ]);
-  const statusTargets = [...new Set([...items, ...syncedFolders].map((item) => item.id))]
-    .sort()
-    .join(',');
+  // Sync status walks each folder's whole tree on the server, so it is read only inside an open
+  // synced folder, once per item each time the folder is opened or refreshed, never polled.
+  const showsSyncStatus = activeTab === 'Sync' && !!parentId && !query;
+  const statusTargets = showsSyncStatus
+    ? [...new Set(items.map((item) => item.id))].sort().join(',')
+    : '';
+  const statusView = JSON.stringify([viewKey, revision, refreshKey]);
+  const statusRequested = useRef({ view: '', ids: new Set<string>() });
   useEffect(() => {
+    if (statusRequested.current.view !== statusView)
+      statusRequested.current = { view: statusView, ids: new Set() };
+    const requested = statusRequested.current.ids;
+    // Items already asked about in this view keep their status; a later page asks for its own.
+    const ids = (statusTargets ? statusTargets.split(',') : []).filter((id) => !requested.has(id));
+    if (!ids.length) return;
+    for (const id of ids) requested.add(id);
+    const answered = new Set<string>();
     const controller = new AbortController();
-    let fetching = false;
-    settledStatuses.current = null;
-    // The statuses shown stay until fresh ones arrive: a new file in the folder changes the
-    // targets, and clearing them would make every badge flicker.
-    const ids = statusTargets ? statusTargets.split(',') : [];
-    async function refreshStatus() {
-      if (fetching || !ids.length || controller.signal.aborted) return;
-      fetching = true;
+    void (async () => {
       try {
-        const statuses: Record<string, SyncItemStatus> = {};
         for (let offset = 0; offset < ids.length; offset += 50) {
           const result = await request(
             '/v1/sync/status?ids=' + ids.slice(offset, offset + 50).join(','),
-            {
-              // Each status walks a folder's whole tree, which takes seconds for a large one;
-              // still inside the API's 29s limit.
-              signal: AbortSignal.any([controller.signal, AbortSignal.timeout(25_000)]),
-            },
+            { signal: AbortSignal.any([controller.signal, AbortSignal.timeout(25_000)]) },
           );
-          for (const status of result.items) statuses[status.itemId] = status;
+          if (controller.signal.aborted) return;
+          for (const id of ids.slice(offset, offset + 50)) answered.add(id);
+          setSyncStatuses((current) => {
+            const next = { ...current };
+            for (const status of result.items as SyncItemStatus[]) next[status.itemId] = status;
+            return next;
+          });
         }
-        if (controller.signal.aborted) return;
-        settledStatuses.current = statuses;
-        setSyncStatuses(statuses);
       } catch {
-        // The last statuses stay shown; the next poll tries again.
-        if (!controller.signal.aborted) settledStatuses.current = null;
-      } finally {
-        fetching = false;
+        // Left unknown; opening the folder again or refreshing asks again.
       }
-    }
-    let checkedAt = Date.now();
-    void refreshStatus();
-    // Each status walks a folder's whole tree on the server, so poll gently: never while hidden,
-    // every 30s, and every 2 minutes once all is synced and pushed changes would refresh it.
-    // Device receipts are not pushed, so a SYNCING badge still needs the 30s poll to settle.
-    const timer = window.setInterval(() => {
-      if (document.visibilityState === 'hidden') return;
-      const settled =
-        isLive() &&
-        !!settledStatuses.current &&
-        Object.values(settledStatuses.current).every((s) => s.state === 'SYNCED');
-      if (Date.now() - checkedAt < (settled ? 120_000 : 30_000)) return;
-      checkedAt = Date.now();
-      void refreshStatus();
-    }, 10_000);
-    const refreshWhenVisible = () => {
-      if (document.visibilityState === 'hidden') return;
-      checkedAt = Date.now();
-      void refreshStatus();
-    };
-    const offLive = onLive((message) => {
-      if (message.type === 'changes') refreshWhenVisible();
-    });
-    window.addEventListener('focus', refreshWhenVisible);
-    window.addEventListener('online', refreshWhenVisible);
-    document.addEventListener('visibilitychange', refreshWhenVisible);
+    })();
     return () => {
       controller.abort();
-      offLive();
-      window.clearInterval(timer);
-      window.removeEventListener('focus', refreshWhenVisible);
-      window.removeEventListener('online', refreshWhenVisible);
-      document.removeEventListener('visibilitychange', refreshWhenVisible);
+      // Cut short by a new page or view: what wasn't answered yet is asked for again.
+      for (const id of ids) if (!answered.has(id)) requested.delete(id);
     };
-  }, [request, statusTargets, parentId, query, revision, refreshKey]);
+  }, [request, statusTargets, statusView]);
   const merged = applyOptimisticItems<Item>(
     [
       ...new Map(
