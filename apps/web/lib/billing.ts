@@ -68,7 +68,10 @@ export type PlanOption = {
   estimate: number | null;
   reason: string | null;
 };
-/** A lifetime seat: storage paid for once. */
+/** A lifetime purchase's size: "500 GB" for the invite-only plan, "3 TB" for a seat. */
+export const lifetimeSize = (terabytes: number) =>
+  terabytes < 1 ? `${terabytes * 1000} GB` : `${terabytes} TB`;
+/** A lifetime seat, or the 500 GB plan (seat 0): storage paid for once. */
 export type LifetimeSeat = {
   seat: number;
   terabytes: number;

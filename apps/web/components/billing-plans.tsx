@@ -4,6 +4,7 @@ import { usePathname, useRouter, useSearchParams } from 'next/navigation';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { Receipt } from 'lucide-react';
 import type { ApiClient } from '@harbor/api-client';
+import { lifetimeSize } from '../lib/billing';
 import { Alert } from './ui/alert';
 import { Button } from './ui/button';
 import { Card } from './ui/card';
@@ -63,8 +64,8 @@ export const planLabel = (planId = 'free', lifetime?: { terabytes: number } | nu
       : `${planId.replace(/(\d+)(gb|tb)/i, (_, n, u) => `${n} ${u.toUpperCase()}`)} plan`;
   if (!lifetime) return plan;
   return planId === 'free'
-    ? `${lifetime.terabytes} TB lifetime`
-    : `${plan} + ${lifetime.terabytes} TB lifetime`;
+    ? `${lifetimeSize(lifetime.terabytes)} lifetime`
+    : `${plan} + ${lifetimeSize(lifetime.terabytes)} lifetime`;
 };
 
 /**

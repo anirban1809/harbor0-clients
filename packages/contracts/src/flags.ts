@@ -91,6 +91,13 @@ export const featureFlags = {
       CHECKOUT_STARTED: 'Opened lifetime checkout',
     },
   },
+  'lifetime-500': {
+    description:
+      'Lifetime 500 GB for $50, only for people who ask: add their account to the allow list and the Storage page offers it. Kept if the flag goes off.',
+    usage: {
+      CHECKOUT_STARTED: 'Opened 500 GB lifetime checkout',
+    },
+  },
 } as const satisfies Record<string, FlagDefinition>;
 type FlagDefinition = {
   /** What staff see for it in the console. */

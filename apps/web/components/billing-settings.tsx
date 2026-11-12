@@ -5,6 +5,7 @@ import { ArrowUpDown, Download, HardDrive, Plus, RotateCcw, XCircle } from 'luci
 import type { ApiClient } from '@harbor/api-client';
 import {
   day,
+  lifetimeSize,
   money,
   samePlan,
   type BillingAccount,
@@ -163,7 +164,7 @@ export function BillingSettings({
           live
             ? `${money(sub.amount, sub.currency)} per ${per}, plus any sales tax or VAT.`
             : seat
-              ? `No plan. A plan’s storage adds to your ${seat.terabytes} TB lifetime seat.`
+              ? `No plan. A plan’s storage adds to your ${lifetimeSize(seat.terabytes)} of lifetime storage.`
               : `${freeStorage} of storage with every feature included.`
         }
         action={
@@ -223,7 +224,7 @@ export function BillingSettings({
             <dt>{sub.cancelAtPeriodEnd ? 'Plan ends' : 'Next payment'}</dt>
             <dd>
               {sub.cancelAtPeriodEnd
-                ? `${day(sub.currentPeriodEnd)} — it won’t renew, and your storage returns to ${seat ? `your ${seat.terabytes} TB lifetime seat` : freeStorage}.`
+                ? `${day(sub.currentPeriodEnd)} — it won’t renew, and your storage returns to ${seat ? `your ${lifetimeSize(seat.terabytes)} of lifetime storage` : freeStorage}.`
                 : `${day(sub.currentPeriodEnd)} · ${money(nextAmount, sub.currency)} plus tax${sub.pendingChange ? ` for ${sub.pendingChange.name}` : ''}`}
             </dd>
             <dt>Customer since</dt>

@@ -92289,6 +92289,35 @@
                         }
                       ]
                     },
+                    "seatsOpen": {
+                      "type": "boolean"
+                    },
+                    "invited": {
+                      "anyOf": [
+                        {
+                          "type": "object",
+                          "properties": {
+                            "terabytes": {
+                              "type": "number"
+                            },
+                            "storageBytes": {
+                              "type": "number"
+                            },
+                            "amount": {
+                              "type": "number"
+                            }
+                          },
+                          "required": [
+                            "terabytes",
+                            "storageBytes",
+                            "amount"
+                          ]
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    },
                     "checkoutAvailable": {
                       "type": "boolean"
                     }
@@ -92302,6 +92331,8 @@
                     "prices",
                     "currency",
                     "owned",
+                    "seatsOpen",
+                    "invited",
                     "checkoutAvailable"
                   ]
                 }
@@ -92654,9 +92685,17 @@
                 "type": "object",
                 "properties": {
                   "terabytes": {
-                    "type": "integer",
-                    "minimum": 1,
-                    "maximum": 5
+                    "anyOf": [
+                      {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 5
+                      },
+                      {
+                        "type": "number",
+                        "const": 0.5
+                      }
+                    ]
                   }
                 },
                 "required": [

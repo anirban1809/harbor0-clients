@@ -40798,6 +40798,12 @@ export interface operations {
                             purchasedAt: string;
                             refundedAt: string | null;
                         } | null;
+                        seatsOpen: boolean;
+                        invited: {
+                            terabytes: number;
+                            storageBytes: number;
+                            amount: number;
+                        } | null;
                         checkoutAvailable: boolean;
                     };
                 };
@@ -40958,7 +40964,7 @@ export interface operations {
         requestBody: {
             content: {
                 "application/json": {
-                    terabytes: number;
+                    terabytes: number | 0.5;
                 };
             };
         };
