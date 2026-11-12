@@ -84,7 +84,6 @@ try {
     const devices = [
       device('device1', 'Alex’s MacBook Pro', 'MACOS'),
       device('device2', 'Studio iMac', 'MACOS'),
-      device('device3', 'Alex’s iPhone', 'IOS'),
     ];
     const on = (...ids: string[]) =>
       ids.map((id) => ({ id, name: devices.find((entry) => entry.id === id)!.name }));
@@ -92,7 +91,9 @@ try {
       item('projects-cloud', 'Projects', 'FOLDER', 0, 29, {
         syncDevices: on('device1', 'device2'),
       }),
-      item('photos-cloud', 'Photos', 'FOLDER', 0, 28, { syncDevices: on('device1', 'device3') }),
+      item('photos-cloud', 'Client work', 'FOLDER', 0, 28, {
+        syncDevices: on('device1', 'device2'),
+      }),
       item('design-cloud', 'Design assets', 'FOLDER', 0, 27, { syncDevices: on('device1') }),
     ];
     const backupRoot = (id: string, name: string, remote: string, deviceId: string) => ({
@@ -210,7 +211,7 @@ try {
       deviceName: 'Alex’s MacBook Pro',
       roots: [
         root('projects', 'Projects', 482e6),
-        root('photos', 'Photos', 6.3e9),
+        root('photos', 'Client work', 6.3e9),
         root('design', 'Design assets', 1.92e9, { shareId: 'share0' }),
         root('desktop', 'Desktop', 1.4e9, {
           mode: 'backup',
@@ -394,7 +395,7 @@ try {
     await expect(page.getByRole('heading', { name: 'Alex’s MacBook Pro' })).toBeVisible();
   }
   await openPlace('Synced Folders');
-  await expect(page.getByText('Also on Studio iMac')).toBeVisible();
+  await expect(page.getByText('Also on Studio iMac').first()).toBeVisible();
   await expect(page.getByText(/GB used$/)).toBeVisible();
   await page.getByRole('button', { name: 'Dismiss sync banner' }).click();
   await capture('sync');
