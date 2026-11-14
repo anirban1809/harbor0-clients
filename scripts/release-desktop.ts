@@ -28,7 +28,7 @@
 // production release that follows them. Install the first test build by hand from its download link.
 import { execFileSync, spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { createReadStream } from 'node:fs';
+import { createReadStream, existsSync } from 'node:fs';
 import { copyFile, mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -314,10 +314,13 @@ try {
   git('worktree', 'add', '--detach', worktree, 'HEAD');
   // Reuse the installed dependencies, and the deploy outputs the build reads its API URL from.
   await symlink(path.join(root, 'node_modules'), path.join(worktree, 'node_modules'));
-  await symlink(
-    path.join(root, 'apps/desktop/node_modules'),
-    path.join(worktree, 'apps/desktop/node_modules'),
-  );
+  // npm makes the desktop's own node_modules only when a dependency can't be hoisted; a link to a
+  // missing one breaks electron-builder.
+  if (existsSync(path.join(root, 'apps/desktop/node_modules')))
+    await symlink(
+      path.join(root, 'apps/desktop/node_modules'),
+      path.join(worktree, 'apps/desktop/node_modules'),
+    );
   // The API URL comes from the backend's live stack; the web URL from the last web deploy here,
   // or its live stack.
   await mkdir(path.join(worktree, '.cloud'), { recursive: true });
