@@ -96,6 +96,32 @@ class DriveParityTest {
         assertFalse(activity.replaceable)
         assertTrue(summarizeUploads(entries.take(1)).single().replaceable)
     }
+    @Test fun savedUploadQueueCarriesOnFromTheNextFile() {
+        val item = DriveItem("item", "Report.pdf", "file", parentId = "folder")
+        val saved = SavedUploads("user", listOf(
+            SavedUpload("b/0", "b", "folder", "content://doc/0", "a.txt", 10, "text/plain", grant = "content://doc/0"),
+            SavedUpload("b/1", "b", "folder", "content://doc/1", "Report.pdf", 20, "application/pdf", target = "replace", item = item),
+            SavedUpload("c/0", "c", null, "content://doc/2", "c.txt", 30, "text/plain", stopped = true)),
+            listOf(UploadEntry("b/0", "a.txt", 10, loaded = 6, phase = UploadPhase.Uploading),
+                UploadEntry("b/1", "Report.pdf", 20, phase = UploadPhase.Failed, error = "Taken", conflict = "file"),
+                UploadEntry("c/0", "c.txt", 30, phase = UploadPhase.Paused),
+                UploadEntry("d/0", "done.txt", 5, phase = UploadPhase.Done)),
+            mapOf("b" to mapOf("/Folder" to "f1"), "d" to mapOf("/Old" to "f2")))
+        val back = resumedUploads(harborJson.decodeFromString(SavedUploads.serializer(), harborJson.encodeToString(SavedUploads.serializer(), saved)))
+        // The file under way starts again; failed and paused files stay as they were; finished ones are gone.
+        assertEquals(listOf(UploadPhase.Queued to 0L, UploadPhase.Failed to 0L, UploadPhase.Paused to 0L), back.entries.map { it.phase to it.loaded })
+        assertEquals(listOf("b/0", "b/1", "c/0"), back.jobs.map { it.key })
+        assertEquals(item, back.jobs[1].item)
+        assertEquals(setOf("b"), back.created.keys)
+        assertEquals("user", back.account)
+    }
+    @Test fun uploadNotificationCountsWhatIsLeft() {
+        assertNull(uploadNotice(listOf(UploadEntry("1", "a.txt", 10, phase = UploadPhase.Done), UploadEntry("2", "b.txt", 10, phase = UploadPhase.Paused))))
+        assertEquals(UploadNotice("Uploading a.mov", "1.0 MB of 4.0 MB", 976, 3906),
+            uploadNotice(listOf(UploadEntry("1", "a.mov", 4_000_000, loaded = 1_000_000, phase = UploadPhase.Uploading))))
+        assertEquals("Uploading 2 files", uploadNotice(listOf(UploadEntry("1", "a", 1, phase = UploadPhase.Uploading),
+            UploadEntry("2", "b", 1), UploadEntry("3", "c", 1, phase = UploadPhase.Failed)))!!.title)
+    }
     @Test fun publicLinkTexts() {
         val now = Instant.parse("2026-10-20T12:00:00Z").toEpochMilli()
         assertEquals("Never expires", linkEnds(null, now))

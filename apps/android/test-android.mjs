@@ -78,7 +78,8 @@ try {
       if (!error.cause) throw error;
     }
   }
-  await run('node', ['--import', 'tsx', 'scripts/local-setup.ts']);
+  // The backend checkout linked by `npm run backend:link`, like apps/backend below.
+  await run('node', ['--import', 'tsx', 'backend/scripts/local-setup.ts']);
   await run('node', ['--import', 'tsx', 'apps/android/enable-test-flags.ts']);
   const fixture = start('node', ['apps/android/fixture-server.mjs']);
   const backend = start('node', ['--import', 'tsx', 'apps/backend/src/local.ts']);

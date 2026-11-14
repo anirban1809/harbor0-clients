@@ -13,8 +13,8 @@ android {
         applicationId = "app.harbor0.android"
         minSdk = 26
         targetSdk = 36
-        versionCode = 3
-        versionName = "0.1.17"
+        versionCode = 4
+        versionName = "0.1.18"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         buildConfigField("String", "API_URL", "\"https://zlh5nzxdy6.execute-api.us-east-1.amazonaws.com\"")
         // The web app, for pages this app can't show yet. Empty when the API is overridden.

@@ -79,7 +79,18 @@ class WorkspaceModel(application: Application): AndroidViewModel(application) {
     val shared = SharedState(this)
     val backups = BackupsState(this)
     val search = SearchState(this)
-    val uploads = UploadQueue(this)
+    /** Shared with [UploadWorker], so uploads outlive this screen. */
+    val uploads = Harbor.uploads(application)
+    private val uploadHost = object : UploadHost {
+        override val folderId get() = drive.folderId
+        override val canWriteHere get() = drive.canWriteHere
+        override fun canEdit(item: DriveItem) = drive.canEdit(item)
+        override fun refused(message: String) { error = message }
+        override fun notify(message: String) = this@WorkspaceModel.notify(message)
+        override fun report(e: Throwable) = this@WorkspaceModel.report(e)
+        override fun message(e: Throwable) = this@WorkspaceModel.message(e)
+        override fun uploaded() { drive.refresh(); refreshAccount() }
+    }
     val sync = SyncState(this)
     /** A ZIP archive opened like a folder in My Drive (flag `zip-preview`). */
     val archive = ArchiveState(this)
@@ -144,18 +155,21 @@ class WorkspaceModel(application: Application): AndroidViewModel(application) {
     val unread get() = activity.count { !it.read }
 
     init {
-        // Foreground transfers do not survive process death. Remove previous temporary snapshots.
+        uploads.host = uploadHost
+        // Downloads and previews do not survive process death. Remove previous temporary snapshots; the upload queue
+        // looks after its own (files copied out of archives wait there for their upload).
         viewModelScope.launch(Dispatchers.IO) {
             File(application.cacheDir, "transfers").deleteRecursively()
             File(application.cacheDir, "previews").deleteRecursively()
-            File(application.cacheDir, "zip-copies").deleteRecursively()
         }
         drive.grid = preferences.getBoolean("drive-grid", false)
         viewModelScope.launch {
             api.signedIn.collect { active ->
                 signedIn = active
                 if (!active) {
-                    transferJob?.cancel(); zipJob?.cancel(); uploads.clear(); pollJob?.cancel(); syncStartJob?.cancel(); linkSyncJob?.cancel(); linkSyncAt = 0
+                    // Not while the session is still being read at launch: a saved upload queue waits for it.
+                    if (!restoring) uploads.clear()
+                    transferJob?.cancel(); zipJob?.cancel(); pollJob?.cancel(); syncStartJob?.cancel(); linkSyncJob?.cancel(); linkSyncAt = 0
                     launch { runCatching { syncController.disconnect() } }
                     sync.reset()
                     account = null; appearance = Appearance(); savedAppearance = Appearance(); appearanceStatus = "idle"
@@ -194,7 +208,7 @@ class WorkspaceModel(application: Application): AndroidViewModel(application) {
         if (busy) return
         actionJob = viewModelScope.launch {
             busy = true; restoring = true; error = null
-            try { api.restore(); if (api.signedIn.value) opened() }
+            try { api.restore(); if (api.signedIn.value) opened() else uploads.clear() }
             catch (e: Exception) { report(e) }
             finally { busy = false; restoring = false }
         }
@@ -206,7 +220,7 @@ class WorkspaceModel(application: Application): AndroidViewModel(application) {
         // An encrypted account opens with this phone's remembered copy of the key, or asks for the passphrase.
         if (user?.encrypted == true) try { encryption.restore() } catch (e: Exception) { report(e) }
         section = Section.Drive
-        if (!encryption.locked) drive.refresh()
+        if (!encryption.locked) { drive.refresh(); uploads.start() }
         startPolling()
         startSync()
         startLinkSync()
@@ -432,7 +446,7 @@ class WorkspaceModel(application: Application): AndroidViewModel(application) {
         }
     }
     /** Unlocked: everything shown while locked is read again with the key, and sync picks up where it stopped. */
-    fun unlocked() { refreshAccount(); refreshSection(); syncController.wake(); linkSyncAt = 0; startLinkSync() }
+    fun unlocked() { uploads.start(); refreshAccount(); refreshSection(); syncController.wake(); linkSyncAt = 0; startLinkSync() }
     /** Locked from Settings: nothing decrypted stays on screen. */
     fun locked() { preview = null; streaming = null; drive.reset(); trash.reset(); shared.reset(); search.reset(); backups.reset(); archive.reset(); photos.reset() }
     /** Saves the recovery key as a text file in Downloads, as the web's Download button. */
@@ -705,5 +719,6 @@ class WorkspaceModel(application: Application): AndroidViewModel(application) {
 
     // Uploads (used by the Drive FAB and tests) ----------------------------------
     fun upload(uri: Uri) = uploads.addUris(listOf(uri))
-    override fun onCleared() { uploads.clear(); super.onCleared() }
+    // Uploads carry on without this screen.
+    override fun onCleared() { if (uploads.host === uploadHost) uploads.host = null; super.onCleared() }
 }

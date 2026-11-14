@@ -24,6 +24,7 @@ object Harbor {
     @Volatile private var api: HarborApi? = null
     @Volatile private var sync: SyncController? = null
     @Volatile private var vault: E2eeVault? = null
+    @Volatile private var uploads: UploadQueue? = null
     /** The signed-in account's end-to-end encryption keys, shared by the app and background sync. */
     fun vault(context: Context): E2eeVault = vault ?: synchronized(this) {
         vault ?: E2eeVault(KeystoreE2eeCopies(context.applicationContext)).also { vault = it }
@@ -37,6 +38,10 @@ object Harbor {
     }
     fun sync(context: Context): SyncController = sync ?: synchronized(this) {
         sync ?: SyncController(context.applicationContext, api(context), vault(context)).also { sync = it }
+    }
+    /** Files picked for upload, which keep going while the app is left (UploadWorker). */
+    fun uploads(context: Context): UploadQueue = uploads ?: synchronized(this) {
+        uploads ?: UploadQueue(context, api(context), FileTransfers(api(context), keys = vault(context).transferKeys())).also { uploads = it }
     }
 }
 /** What sync says while an encrypted account is locked on this phone (desktop `engine.hold`). */

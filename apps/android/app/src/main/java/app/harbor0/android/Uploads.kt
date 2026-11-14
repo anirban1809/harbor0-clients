@@ -1,16 +1,19 @@
 package app.harbor0.android
 
+import android.content.Context
+import android.content.Intent
 import android.net.Uri
 import android.provider.DocumentsContract
 import android.provider.OpenableColumns
 import androidx.compose.runtime.*
-import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.*
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.serialization.Serializable
 import java.io.File
 import java.util.UUID
 import kotlinx.serialization.json.put
 
-enum class UploadPhase { Queued, Hashing, Uploading, Paused, Done, Failed }
+@Serializable enum class UploadPhase { Queued, Hashing, Uploading, Paused, Done, Failed }
 /** How a file lands: under its own name, as a new version of an item, or beside a same-named one. */
 sealed interface UploadTarget {
     data object New: UploadTarget
@@ -18,7 +21,7 @@ sealed interface UploadTarget {
     data object KeepBoth: UploadTarget
 }
 /** One file's upload. Files from a chosen folder share a group, shown as one row. [conflict] is "file" or "folder" when the name is taken. */
-data class UploadEntry(val key: String, val name: String, val size: Long, val loaded: Long = 0, val phase: UploadPhase = UploadPhase.Queued,
+@Serializable data class UploadEntry(val key: String, val name: String, val size: Long, val loaded: Long = 0, val phase: UploadPhase = UploadPhase.Queued,
     val error: String? = null, val groupKey: String? = null, val groupName: String? = null, val conflict: String? = null)
 data class UploadActivity(val key: String, val folder: Boolean, val name: String, val size: Long, val loaded: Long, val phase: UploadPhase,
     val error: String?, val files: Int, val filesDone: Int, val filesFailed: Int, val keys: List<String>,
@@ -42,7 +45,9 @@ fun uploadErrorMessage(e: Throwable, fallback: (Throwable) -> String = { it.mess
 /** A file picked on this device, with the folders to create above it for folder uploads. */
 data class PickedFile(val uri: Uri, val name: String, val size: Long, val mime: String, val folders: List<String> = emptyList(),
     /** A private file made only for this upload (a file unpacked from an archive), removed once it is uploaded or cancelled. */
-    val temporary: java.io.File? = null)
+    val temporary: java.io.File? = null,
+    /** The picked document or folder whose read permission harbor0 kept, given back once its files are uploaded. */
+    val grant: Uri? = null)
 
 /** Rolls folder uploads into one row each, as the web upload tray does. */
 fun summarizeUploads(entries: List<UploadEntry>): List<UploadActivity> = entries.groupBy { it.groupKey ?: it.key }.map { (key, members) ->
@@ -80,10 +85,62 @@ fun uploadDetail(a: UploadActivity): String {
     }
 }
 
-/** Uploads one file at a time; paused, cancelled or already running files are skipped. Pausing restarts that file when resumed. */
-class UploadQueue(private val m: WorkspaceModel) {
+/** What the queue needs from the open app: where new uploads go, and how to show what happened. Null while no screen is open. */
+interface UploadHost {
+    val folderId: String?
+    val canWriteHere: Boolean
+    fun canEdit(item: DriveItem): Boolean
+    fun refused(message: String)
+    fun notify(message: String)
+    fun report(e: Throwable)
+    fun message(e: Throwable): String
+    /** A file finished uploading: the open folder and the storage figures are refreshed. */
+    fun uploaded()
+}
+
+/** One queued file as saved on this phone, so the queue carries on after Android ends the app. [grant] is the picked document or tree whose read permission was kept. */
+@Serializable data class SavedUpload(val key: String, val batch: String, val base: String?, val uri: String, val name: String, val size: Long, val mime: String,
+    val folders: List<String> = emptyList(), val temporary: String? = null, val grant: String? = null,
+    /** "new", "replace" (over [item]) or "keep-both". */
+    val target: String = "new", val item: DriveItem? = null, val stopped: Boolean = false)
+@Serializable data class SavedUploads(val account: String? = null, val jobs: List<SavedUpload> = emptyList(), val entries: List<UploadEntry> = emptyList(),
+    /** Folders already created for each batch, by path. */
+    val created: Map<String, Map<String, String>> = emptyMap())
+
+/** The saved queue as it comes back after the app was ended: finished files are dropped and the file under way starts again from the queue. */
+fun resumedUploads(saved: SavedUploads): SavedUploads {
+    val keys = saved.jobs.map { it.key }.toSet()
+    val entries = saved.entries.filter { it.phase != UploadPhase.Done && it.key in keys }.map {
+        if (it.phase == UploadPhase.Hashing || it.phase == UploadPhase.Uploading) it.copy(phase = UploadPhase.Queued, loaded = 0) else it
+    }
+    val left = entries.map { it.key }.toSet()
+    val jobs = saved.jobs.filter { it.key in left }
+    return saved.copy(jobs = jobs, entries = entries, created = saved.created.filterKeys { batch -> jobs.any { it.batch == batch } })
+}
+
+/** The "Uploading" notification's title, text and progress (in KB, as Android's progress is an int), or null when nothing is moving. */
+data class UploadNotice(val title: String, val detail: String, val loaded: Int, val total: Int)
+fun uploadNotice(entries: List<UploadEntry>): UploadNotice? {
+    val moving = entries.filter { it.phase == UploadPhase.Queued || it.phase == UploadPhase.Hashing || it.phase == UploadPhase.Uploading }
+    if (moving.isEmpty()) return null
+    val size = moving.sumOf { it.size }; val loaded = moving.sumOf { it.loaded }
+    val title = if (moving.size == 1) "Uploading ${moving.single().name}" else "Uploading ${plural(moving.size, "file")}"
+    return UploadNotice(title, "${bytesLabel(loaded)} of ${bytesLabel(size)}", (loaded / 1024).toInt(), (size / 1024).toInt())
+}
+
+/**
+ * Uploads one file at a time; paused, cancelled or already running files are skipped. Pausing restarts that file when
+ * resumed. One queue serves the whole process (Harbor.uploads), so uploads keep going when the app is left or its
+ * screen is closed: [UploadWorker] keeps the process running meanwhile, and the queue is saved on this phone, so a
+ * queue Android ended carries on from its next file (the file under way starts over).
+ */
+class UploadQueue(context: Context, private val api: HarborApi, private val transfers: FileTransfers) {
+    private val context = context.applicationContext
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
+    @Volatile var host: UploadHost? = null
     var entries by mutableStateOf<List<UploadEntry>>(emptyList()); private set
-    private class Job(val file: PickedFile, val batch: String, val base: String?, var stopped: Boolean = false, var target: UploadTarget = UploadTarget.New) {
+    private class Job(val file: PickedFile, val batch: String, val base: String?, var stopped: Boolean = false, var target: UploadTarget = UploadTarget.New,
+        val grant: Uri? = null) {
         /** The folder the file goes into, once its folders exist. */
         var parentId: String? = base
     }
@@ -92,21 +149,82 @@ class UploadQueue(private val m: WorkspaceModel) {
     private val created = mutableMapOf<String, MutableMap<String, String>>()
     private var runner: kotlinx.coroutines.Job? = null
     private var current: Pair<String, kotlinx.coroutines.Job>? = null
+    /** The account the saved queue belongs to, and whether this process checked it is still the one signed in. */
+    private var account: String? = null
+    private var verified = false
+    private val store = File(this.context.filesDir, "uploads.json")
+    private val saves = MutableStateFlow<SavedUploads?>(null)
     val active get() = entries.any { it.phase == UploadPhase.Queued || it.phase == UploadPhase.Hashing || it.phase == UploadPhase.Uploading }
-    private fun update(key: String, change: (UploadEntry) -> UploadEntry) { entries = entries.map { if (it.key == key) change(it) else it } }
+    private fun update(key: String, change: (UploadEntry) -> UploadEntry) {
+        val before = entries.firstOrNull { it.key == key }?.phase
+        entries = entries.map { if (it.key == key) change(it) else it }
+        if (entries.firstOrNull { it.key == key }?.phase != before) save()
+    }
 
-    fun clear() { runner?.cancel(); current?.second?.cancel(); jobs.clear(); created.clear(); entries = emptyList() }
+    init {
+        load()
+        // The latest state only, written in order.
+        scope.launch(Dispatchers.IO) {
+            saves.collect { saved -> if (saved != null) runCatching {
+                val next = File(store.path + ".tmp")
+                next.writeText(harborJson.encodeToString(SavedUploads.serializer(), saved))
+                check(next.renameTo(store))
+            } }
+        }
+    }
+    private fun load() {
+        // Nothing was under way when the process started: copies of files from an earlier run are stale.
+        File(context.cacheDir, "uploads").deleteRecursively()
+        val saved = runCatching { resumedUploads(harborJson.decodeFromString(SavedUploads.serializer(), store.readText())) }.getOrNull()
+        val kept = saved?.jobs?.mapNotNull { it.temporary }?.map { File(it).canonicalPath }?.toSet().orEmpty()
+        File(context.cacheDir, "zip-copies").takeIf { it.exists() }?.walkBottomUp()?.forEach { if (it.isFile && it.canonicalPath !in kept || it.isDirectory && it.list()?.isEmpty() == true) it.delete() }
+        if (saved == null) return
+        account = saved.account
+        for (s in saved.jobs) {
+            val target = when (s.target) { "replace" -> s.item?.let { UploadTarget.Replace(it) } ?: UploadTarget.New; "keep-both" -> UploadTarget.KeepBoth; else -> UploadTarget.New }
+            jobs[s.key] = Job(PickedFile(Uri.parse(s.uri), s.name, s.size, s.mime, s.folders, s.temporary?.let(::File)), s.batch, s.base, s.stopped, target, s.grant?.let(Uri::parse))
+        }
+        saved.created.forEach { (batch, folders) -> created[batch] = folders.toMutableMap() }
+        entries = saved.entries
+    }
+    private fun save() {
+        saves.value = SavedUploads(account, jobs.map { (key, job) ->
+            val target = job.target
+            SavedUpload(key, job.batch, job.base, job.file.uri.toString(), job.file.name, job.file.size, job.file.mime, job.file.folders, job.file.temporary?.path,
+                job.grant?.toString(), when (target) { is UploadTarget.Replace -> "replace"; UploadTarget.KeepBoth -> "keep-both"; UploadTarget.New -> "new" },
+                (target as? UploadTarget.Replace)?.item, job.stopped)
+        }, entries, created.mapValues { it.value.toMap() })
+    }
+    /** Keeps reading a picked document or folder after the app is ended. Not every app's documents allow it; those upload only while harbor0 runs. */
+    private fun keep(uri: Uri): Uri? = runCatching {
+        context.contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION); uri
+    }.getOrNull()
+    private fun release(removed: Collection<Job>) {
+        val used = jobs.values.mapNotNull { it.grant }.toSet()
+        removed.forEach { job ->
+            job.file.temporary?.delete()
+            job.grant?.takeIf { it !in used }?.let { runCatching { context.contentResolver.releasePersistableUriPermission(it, Intent.FLAG_GRANT_READ_URI_PERMISSION) } }
+        }
+    }
+
+    /** Signed out: everything stops and the saved queue is forgotten. */
+    fun clear() {
+        runner?.cancel(); current?.second?.cancel()
+        val removed = jobs.values.toList(); jobs.clear(); release(removed)
+        created.clear(); entries = emptyList(); account = null; verified = false; save()
+    }
     fun addUris(uris: List<Uri>) {
-        m.viewModelScope.launch {
-            try { add(withContext(Dispatchers.IO) { uris.map { describe(it) } }) } catch (e: CancellationException) { throw e } catch (e: Exception) { m.report(e) }
+        scope.launch {
+            try { add(withContext(Dispatchers.IO) { uris.map { describe(it).copy(grant = keep(it)) } }) } catch (e: CancellationException) { throw e } catch (e: Exception) { host?.report(e) }
         }
     }
     /** Walks a folder chosen with the system picker and uploads every file inside it, recreating its subfolders. */
     fun addTree(tree: Uri) {
-        m.viewModelScope.launch {
+        scope.launch {
             try {
                 val files = withContext(Dispatchers.IO) {
-                    val resolver = m.context.contentResolver
+                    val grant = keep(tree)
+                    val resolver = context.contentResolver
                     val rootId = DocumentsContract.getTreeDocumentId(tree)
                     val rootName = resolver.query(DocumentsContract.buildDocumentUriUsingTree(tree, rootId), arrayOf(DocumentsContract.Document.COLUMN_DISPLAY_NAME), null, null, null)
                         ?.use { if (it.moveToFirst()) it.getString(0) else null } ?: "Folder"
@@ -117,19 +235,19 @@ class UploadQueue(private val m: WorkspaceModel) {
                             while (c.moveToNext()) {
                                 val child = c.getString(0); val name = c.getString(1) ?: continue; val mime = c.getString(2) ?: "application/octet-stream"
                                 if (mime == DocumentsContract.Document.MIME_TYPE_DIR) walk(child, path + name)
-                                else out += PickedFile(DocumentsContract.buildDocumentUriUsingTree(tree, child), name, if (c.isNull(3)) 0 else c.getLong(3), mime, path)
+                                else out += PickedFile(DocumentsContract.buildDocumentUriUsingTree(tree, child), name, if (c.isNull(3)) 0 else c.getLong(3), mime, path, grant = grant)
                             }
                         }
                     }
                     walk(rootId, listOf(rootName))
                     out
                 }
-                if (files.isEmpty()) m.notify("This folder has no files to upload.") else add(files)
-            } catch (e: CancellationException) { throw e } catch (e: Exception) { m.report(e) }
+                if (files.isEmpty()) host?.notify("This folder has no files to upload.") else add(files)
+            } catch (e: CancellationException) { throw e } catch (e: Exception) { host?.report(e) }
         }
     }
     private fun describe(uri: Uri): PickedFile {
-        val resolver = m.context.contentResolver
+        val resolver = context.contentResolver
         var name = "Upload"; var size = 0L
         resolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME, OpenableColumns.SIZE), null, null, null)?.use { c ->
             if (c.moveToFirst()) { c.getString(0)?.let { name = it }; if (!c.isNull(1)) size = c.getLong(1) }
@@ -138,18 +256,18 @@ class UploadQueue(private val m: WorkspaceModel) {
     }
     /** Uploads a file chosen on this phone as a new version of [item], keeping its name. */
     fun addVersion(uri: Uri, item: DriveItem) {
-        m.viewModelScope.launch {
+        scope.launch {
             try {
-                val picked = withContext(Dispatchers.IO) { describe(uri) }.copy(name = item.name)
+                val picked = withContext(Dispatchers.IO) { describe(uri).copy(grant = keep(uri)) }.copy(name = item.name)
                 add(listOf(picked), UploadTarget.Replace(item), item.parentId)
-            } catch (e: CancellationException) { throw e } catch (e: Exception) { m.report(e) }
+            } catch (e: CancellationException) { throw e } catch (e: Exception) { host?.report(e) }
         }
     }
     fun add(files: List<PickedFile>, target: UploadTarget = UploadTarget.New, into: String? = null) {
-        val drive = m.drive
-        if (target is UploadTarget.Replace) { if (!drive.canEdit(target.item)) { m.error = "You can’t upload to this folder."; return } }
-        else if (!drive.canWriteHere) { m.error = "Uploads are unavailable in this location"; return }
-        enqueue(files, target, if (target is UploadTarget.Replace) into else drive.folderId)
+        val host = host ?: return release(files.map { Job(it, "", null, grant = it.grant) })
+        if (target is UploadTarget.Replace) { if (!host.canEdit(target.item)) { host.refused("You can’t upload to this folder."); return } }
+        else if (!host.canWriteHere) { host.refused("Uploads are unavailable in this location"); return }
+        enqueue(files, target, if (target is UploadTarget.Replace) into else host.folderId)
     }
     /** Uploads files unpacked on this phone (from an archive) into [parent]; null is the top of My Drive. */
     fun addCopies(files: List<PickedFile>, parent: String?) = enqueue(files, UploadTarget.New, parent)
@@ -157,17 +275,31 @@ class UploadQueue(private val m: WorkspaceModel) {
         val batch = UUID.randomUUID().toString()
         val queued = files.mapIndexed { index, file ->
             val key = "$batch/$index"
-            jobs[key] = Job(file, batch, base, target = target)
+            jobs[key] = Job(file, batch, base, target = target, grant = file.grant)
             UploadEntry(key, file.name, file.size, groupKey = file.folders.firstOrNull()?.let { "$batch/$it" }, groupName = file.folders.firstOrNull())
         }
         entries = entries + queued
-        drain()
+        save()
+        start()
     }
-    private fun drain() {
+    /** Uploads what is queued, with the "Uploading" service keeping it going when the app is left. Best called while the app is on screen. */
+    fun start() {
+        if (!active) return
+        runCatching { UploadWorker.start(context) }
         if (runner?.isActive == true) return
-        runner = m.viewModelScope.launch {
+        runner = scope.launch {
             while (true) {
                 val key = entries.firstOrNull { it.phase == UploadPhase.Queued && jobs[it.key]?.stopped == false }?.key ?: break
+                // A queue saved by an account that has since signed out is never uploaded to another one.
+                if (!verified) {
+                    val me = try { api.get<Account>("/v1/users/me").user.id } catch (e: CancellationException) { throw e } catch (e: ApiException) {
+                        if (e.status == 401) { clear(); break } else null
+                    } catch (_: Exception) { null }
+                    if (me == null) { delay(RETRY_MS); continue }
+                    if (account != null && account != me) { clear(); break }
+                    if (account == null) { account = me; save() }
+                    verified = true
+                }
                 val job = launch { run(key) }
                 current = key to job
                 job.join()
@@ -177,43 +309,23 @@ class UploadQueue(private val m: WorkspaceModel) {
     }
     private suspend fun run(key: String) {
         val job = jobs[key] ?: return
-        val scratch = File(m.context.cacheDir, "transfers/${UUID.randomUUID()}")
+        val scratch = File(context.cacheDir, "uploads/${UUID.randomUUID()}")
         try {
             update(key) { it.copy(phase = UploadPhase.Hashing, error = null, loaded = 0, conflict = null) }
-            val parent = parentFor(job)
             val name = safeName(job.file.name)
-            val target = job.target
-            withContext(Dispatchers.IO) {
-                check(scratch.parentFile!!.mkdirs() || scratch.parentFile!!.isDirectory)
-                m.context.contentResolver.openInputStream(job.file.uri)?.use { input -> scratch.outputStream().use { output ->
-                    val buffer = ByteArray(256 * 1024)
-                    while (true) { ensureActive(); val n = input.read(buffer); if (n < 0) break; output.write(buffer, 0, n) }
-                } } ?: error("The selected file could not be opened. Select it again.")
-            }
-            val size = scratch.length()
-            update(key) { it.copy(size = size) }
-            val progress = { label: String, fraction: Float? ->
-                m.viewModelScope.launch {
-                    update(key) { it.copy(phase = if (label.startsWith("Uploading")) UploadPhase.Uploading else UploadPhase.Hashing,
-                        loaded = ((fraction ?: 0f) * size).toLong()) }
-                }
-                Unit
-            }
-            when (target) {
-                is UploadTarget.Replace -> m.transfers.upload(scratch, name, job.file.mime, parent, {
-                    put("driveItemId", target.item.id); target.item.revision?.let { put("baseRevision", it) }
-                }, progress = progress)
-                // Keeping both tries “name (2)”, “name (3)” and so on until a name is free.
-                UploadTarget.KeepBoth -> for (n in 1..50) {
-                    try { m.transfers.upload(scratch, if (n == 1) name else numberedName(name, n), job.file.mime, parent, progress = progress); break }
-                    catch (e: ApiException) { if (e.code != "NAME_CONFLICT" || n == 50) throw e }
-                }
-                UploadTarget.New -> m.transfers.upload(scratch, name, job.file.mime, parent, progress = progress)
+            for (attempt in 0..NETWORK_RETRIES) try {
+                upload(key, job, name, scratch)
+                break
+            } catch (e: java.io.IOException) {
+                // Dropped connections are common on phones, more so in the background: the file starts again a little later.
+                if (attempt == NETWORK_RETRIES) throw e
+                update(key) { it.copy(phase = UploadPhase.Hashing, loaded = 0) }
+                delay(minOf(60_000L, 5_000L shl attempt))
             }
             update(key) { it.copy(phase = UploadPhase.Done, loaded = it.size) }
-            jobs.remove(key)
-            withContext(Dispatchers.IO) { job.file.temporary?.delete() }
-            m.drive.refresh(); m.refreshAccount()
+            jobs.remove(key)?.let { release(listOf(it)) }
+            save()
+            host?.uploaded()
         } catch (e: CancellationException) {
             if (jobs[key]?.stopped == true) update(key) { it.copy(phase = UploadPhase.Paused) }
             if (!currentCoroutineContext().isActive && jobs[key] == null) return
@@ -226,23 +338,55 @@ class UploadQueue(private val m: WorkspaceModel) {
                     if (runCatching { findByName(job.parentId, job.file.name) }.getOrNull()?.isFolder == true) "folder" else "file"
                 else -> null
             }
-            update(key) { it.copy(phase = UploadPhase.Failed, error = uploadErrorMessage(e, m::message), conflict = conflict) }
+            update(key) { it.copy(phase = UploadPhase.Failed, error = uploadErrorMessage(e) { host?.message(it) ?: it.message ?: "Upload failed" }, conflict = conflict) }
         } finally { withContext(NonCancellable + Dispatchers.IO) { scratch.delete() } }
+    }
+    private suspend fun upload(key: String, job: Job, name: String, scratch: File) {
+        val parent = parentFor(job)
+        val target = job.target
+        withContext(Dispatchers.IO) {
+            check(scratch.parentFile!!.mkdirs() || scratch.parentFile!!.isDirectory)
+            val input = try { context.contentResolver.openInputStream(job.file.uri) } catch (_: SecurityException) { null }
+            input?.use { scratch.outputStream().use { output ->
+                val buffer = ByteArray(256 * 1024)
+                while (true) { ensureActive(); val n = it.read(buffer); if (n < 0) break; output.write(buffer, 0, n) }
+            } } ?: error("The selected file could not be opened. Select it again.")
+        }
+        val size = scratch.length()
+        update(key) { it.copy(size = size) }
+        val progress = { label: String, fraction: Float? ->
+            scope.launch {
+                update(key) { it.copy(phase = if (label.startsWith("Uploading")) UploadPhase.Uploading else UploadPhase.Hashing,
+                    loaded = ((fraction ?: 0f) * size).toLong()) }
+            }
+            Unit
+        }
+        when (target) {
+            is UploadTarget.Replace -> transfers.upload(scratch, name, job.file.mime, parent, {
+                put("driveItemId", target.item.id); target.item.revision?.let { put("baseRevision", it) }
+            }, progress = progress)
+            // Keeping both tries “name (2)”, “name (3)” and so on until a name is free.
+            UploadTarget.KeepBoth -> for (n in 1..50) {
+                try { transfers.upload(scratch, if (n == 1) name else numberedName(name, n), job.file.mime, parent, progress = progress); break }
+                catch (e: ApiException) { if (e.code != "NAME_CONFLICT" || n == 50) throw e }
+            }
+            UploadTarget.New -> transfers.upload(scratch, name, job.file.mime, parent, progress = progress)
+        }
     }
     /** The item in [parent] whose name matches, the way the server compares names. */
     private suspend fun findByName(parent: String?, name: String): DriveItem? {
         val wanted = java.text.Normalizer.normalize(name, java.text.Normalizer.Form.NFC).lowercase()
-        return m.api.all<DriveItem>("/v1/drive/folders/${HarborApi.segment(parent ?: "root")}/children")
+        return api.all<DriveItem>("/v1/drive/folders/${HarborApi.segment(parent ?: "root")}/children")
             .firstOrNull { java.text.Normalizer.normalize(it.name, java.text.Normalizer.Form.NFC).lowercase() == wanted }
     }
     /** Uploads files whose name is taken as new versions of the existing files. */
     fun replace(keys: List<String>) {
-        m.viewModelScope.launch {
+        scope.launch {
             for (key in keys) {
                 val job = jobs[key] ?: continue
                 // Always the latest revision, so a replace that lost a race can simply be tried again.
                 val existing = runCatching {
-                    (job.target as? UploadTarget.Replace)?.let { m.api.get<ItemResponse>("/v1/drive/items/${HarborApi.segment(it.item.id)}").item }
+                    (job.target as? UploadTarget.Replace)?.let { api.get<ItemResponse>("/v1/drive/items/${HarborApi.segment(it.item.id)}").item }
                         ?: findByName(job.parentId, job.file.name)
                 }.getOrNull()
                 if (existing == null || existing.isFolder) {
@@ -268,7 +412,7 @@ class UploadQueue(private val m: WorkspaceModel) {
         var path = ""
         for (name in job.file.folders) {
             path += "/$name"
-            parent = folders[path] ?: m.api.createFolder(name, parent).id.also { folders[path] = it }
+            parent = folders[path] ?: api.createFolder(name, parent).id.also { folders[path] = it; save() }
         }
         job.parentId = parent
         return parent
@@ -279,22 +423,28 @@ class UploadQueue(private val m: WorkspaceModel) {
             job.stopped = true
             if (current?.first == key) current?.second?.cancel() else update(key) { if (it.phase == UploadPhase.Queued) it.copy(phase = UploadPhase.Paused) else it }
         }
+        save()
     }
     fun resume(keys: List<String>) {
         for (key in keys) { jobs[key]?.stopped = false; if (jobs.containsKey(key)) update(key) { it.copy(phase = UploadPhase.Queued, error = null) } }
-        drain()
+        save()
+        start()
     }
     fun cancel(keys: List<String>) {
-        for (key in keys) {
-            val job = jobs.remove(key) ?: continue
-            job.stopped = true; job.file.temporary?.delete()
-            if (current?.first == key) current?.second?.cancel()
-        }
+        val removed = keys.mapNotNull { key -> jobs.remove(key)?.also { job -> job.stopped = true; if (current?.first == key) current?.second?.cancel() } }
+        release(removed)
         entries = entries.filter { it.key !in keys }
+        save()
     }
     fun dismiss() {
         val finished = summarizeUploads(entries).filter { it.phase == UploadPhase.Done || it.phase == UploadPhase.Failed }.flatMap { it.keys }.toSet()
-        finished.forEach { jobs.remove(it) }
+        release(finished.mapNotNull { jobs.remove(it) })
         entries = entries.filter { it.key !in finished }
+        save()
+    }
+
+    private companion object {
+        const val NETWORK_RETRIES = 6
+        const val RETRY_MS = 15_000L
     }
 }
