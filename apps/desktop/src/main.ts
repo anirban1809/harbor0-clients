@@ -64,8 +64,8 @@ import {
   syncAllLinks,
   syncLinkWraps,
 } from '../../web/lib/e2ee-links';
-import { migrationFlags, publicLinkSchema } from '@harbor/contracts';
-import { contained, safeSegment, safeParents } from './paths';
+import { migrationFlags, publicLinkSchema, type DriveItem } from '@harbor/contracts';
+import { contained, numberedName, safeSegment, safeParents } from './paths';
 import type { FileUpload } from '../../web/lib/upload-activity';
 import { prepareAppEnvironment } from './app-environment';
 import { DesktopSession, isSessionError, requestRenewal } from './session';
@@ -415,6 +415,11 @@ const davDriveItems = (): SyncDriveItem[] =>
 /** Files this app is uploading, which the WebDAV server lists until they land. */
 const appUploads = new Map<string, AppUpload>();
 const sendAppUploads = () => webdav.appUploads([...appUploads.values()]);
+/** Uploads refused because the name is taken, kept for Replace or Keep both in the upload card. */
+const conflictedUploads = new Map<
+  string,
+  { upload: FileUpload; path: string; parentId: string | null }
+>();
 // The folder the window shows, whose pending sync items the status lists; null for none.
 let visibleFolder: string | null = null;
 const statusView = (activeJournal: Journal, state: SyncRuntime) => {
@@ -1456,6 +1461,127 @@ app
       engine?.pause(i.paused);
       return { paused: i.paused };
     });
+    /** The item with this name in a folder, compared the way the server keeps names unique. */
+    const itemNamed = (parentId: string | null, name: string) =>
+      api
+        .request(
+          `/v1/drive/folders/${parentId ? encodeURIComponent(parentId) : 'root'}/lookup?name=${encodeURIComponent(name)}`,
+        )
+        .then(({ item }) => item as DriveItem)
+        .catch((error) => {
+          if (error instanceof ApiError && error.code === 'ITEM_NOT_FOUND') return undefined;
+          throw error;
+        });
+    const nameTaken = (existing: DriveItem | undefined): Partial<FileUpload> =>
+      existing?.type === 'FOLDER'
+        ? { conflict: 'folder', error: 'A folder has this name, so it can’t be replaced.' }
+        : { conflict: 'file', error: 'A file with this name is already here.' };
+    /** A file unpacked from an archive into a temporary folder, removed once it is settled. */
+    const releaseStaged = (filename: string) => {
+      if (filename.startsWith(STAGED_UPLOADS + path.sep))
+        void rm(path.dirname(filename), { recursive: true, force: true }).catch(() => {});
+    };
+    const keptForConflict = (filename: string) =>
+      [...conflictedUploads.values()].some((c) => c.path === filename);
+    /** Uploads a chosen or dropped file; with `existing`, as a new version of that file. */
+    const sendFile = async (
+      upload: FileUpload,
+      filename: string,
+      name: string,
+      parentId: string | null,
+      report: (change: Partial<FileUpload>) => void,
+      existing?: { itemId: string; revision: number },
+    ) => {
+      report({ phase: 'hashing' });
+      const key = 'manual-upload:' + createHash('sha256').update(filename).digest('hex');
+      const state = journal.get<UploadState>(key) ?? { operationId: crypto.randomUUID() };
+      const item = await uploadFile(
+        api,
+        filename,
+        name,
+        parentId,
+        state,
+        () => journal.set(key, state),
+        existing,
+        (loaded) => report({ phase: 'uploading', loaded }),
+      );
+      journal.set(key, null);
+      webdav.landed(item);
+      report({ phase: 'done', loaded: upload.size, error: undefined, conflict: undefined });
+      return item;
+    };
+    ipc(
+      'resolveUploads',
+      z
+        .object({
+          keys: z.array(z.string().max(200)).min(1).max(10_000),
+          mode: z.enum(['replace', 'keepBoth']),
+        })
+        .strict(),
+      async (input: { keys: string[]; mode: 'replace' | 'keepBoth' }) => {
+        const chosen = input.keys.flatMap((key) => {
+          const conflict = conflictedUploads.get(key);
+          return conflict ? [conflict] : [];
+        });
+        const sendProgress = (changed: FileUpload[]) => send('harbor:upload-progress', changed);
+        sendProgress(
+          chosen.map(({ upload }) =>
+            Object.assign(upload, {
+              phase: 'queued' as const,
+              error: undefined,
+              conflict: undefined,
+            }),
+          ),
+        );
+        let failed = 0;
+        for (const { upload, path: filename, parentId } of chosen) {
+          const report = (change: Partial<FileUpload>) =>
+            sendProgress([Object.assign(upload, change)]);
+          try {
+            if (input.mode === 'replace') {
+              // Always the latest revision, so a replace that lost a race can be tried again.
+              const existing = await itemNamed(parentId, upload.name);
+              if (existing && existing.type !== 'FILE') {
+                report({ phase: 'failed', ...nameTaken(existing) });
+                failed++;
+                continue;
+              }
+              await sendFile(
+                upload,
+                filename,
+                upload.name,
+                parentId,
+                report,
+                existing && { itemId: existing.id, revision: existing.revision },
+              );
+            } else {
+              // Keeping both tries “name (2)”, “name (3)” and so on until a name is free.
+              for (let n = 2; ; n++) {
+                if (n > 50) throw new Error('Too many files here already share this name.');
+                const name = numberedName(upload.name, n);
+                if (await itemNamed(parentId, name)) continue;
+                try {
+                  await sendFile(upload, filename, name, parentId, report);
+                  break;
+                } catch (error) {
+                  if (!(error instanceof ApiError && error.code === 'NAME_CONFLICT')) throw error;
+                }
+              }
+            }
+            conflictedUploads.delete(upload.key);
+            releaseStaged(filename);
+          } catch (error) {
+            failed++;
+            report({ phase: 'failed', error: (error as Error).message });
+          }
+        }
+        if (failed)
+          throw new Error(
+            `${failed} of ${chosen.length} ${chosen.length === 1 ? 'file' : 'files'} couldn’t be uploaded.`,
+          );
+        return { uploaded: chosen.length };
+      },
+    );
     ipc(
       'upload',
       z
@@ -1523,7 +1649,8 @@ app
               path: filename,
             });
         sendAppUploads();
-        const items = [];
+        const items: DriveItem[] = [];
+        let conflicts = 0;
         // Folders created for this drop, keyed by their path under the drop target. A folder
         // that can't be created fails every file in it without retrying.
         const folderIds = new Map<string, Promise<string>>();
@@ -1552,24 +1679,24 @@ app
               });
               sendAppUploads();
             }
-            report({ phase: 'hashing' });
-            const key = 'manual-upload:' + createHash('sha256').update(filename).digest('hex');
-            const state = journal.get<UploadState>(key) ?? { operationId: crypto.randomUUID() };
-            const item = await uploadFile(
-              api,
-              filename,
-              path.basename(filename),
-              parentId,
-              state,
-              () => journal.set(key, state),
-              undefined,
-              (loaded) => report({ phase: 'uploading', loaded }),
-            );
-            journal.set(key, null);
-            items.push(item);
-            appUploads.delete(upload.key);
-            webdav.landed(item);
-            report({ phase: 'done', loaded: upload.size });
+            try {
+              items.push(await sendFile(upload, filename, upload.name, parentId, report));
+            } catch (error) {
+              if (!(error instanceof ApiError && error.code === 'NAME_CONFLICT')) throw error;
+              const existing = await itemNamed(parentId, upload.name);
+              // The same file picked again, after part of a batch failed say: already uploaded.
+              if (existing?.type === 'FILE' && existing.sizeBytes === upload.size) {
+                items.push(existing);
+                report({ phase: 'done', loaded: upload.size });
+                continue;
+              }
+              conflictedUploads.set(upload.key, { upload, path: filename, parentId });
+              conflicts++;
+              report({
+                phase: 'failed',
+                ...nameTaken(existing),
+              });
+            }
           } catch (error) {
             report({ phase: 'failed', error: (error as Error).message });
           } finally {
@@ -1577,12 +1704,13 @@ app
           }
         }
         for (const { path: filename } of files)
-          if (filename.startsWith(STAGED_UPLOADS + path.sep))
-            void rm(path.dirname(filename), { recursive: true, force: true }).catch(() => {});
+          if (!keptForConflict(filename)) releaseStaged(filename);
         const failed = files.length - items.length;
         if (failed)
           throw new Error(
-            `${failed} of ${files.length} ${files.length === 1 ? 'file' : 'files'} couldn’t be uploaded.`,
+            failed === conflicts
+              ? `${failed} of ${files.length} ${files.length === 1 ? 'file has a name' : 'files have names'} already used here. Replace them or keep both.`
+              : `${failed} of ${files.length} ${files.length === 1 ? 'file' : 'files'} couldn’t be uploaded.`,
           );
         if (input.recipient) {
           await api.request('/v1/transfers', {

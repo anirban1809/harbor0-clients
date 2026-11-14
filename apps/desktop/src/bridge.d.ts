@@ -90,6 +90,8 @@ declare global {
         parentId: string | null;
       }) => Promise<any>;
       upload: (input: { parentId: string | null; recipient?: string }) => Promise<any>;
+      /** Uploads files refused for a taken name as new versions, or under numbered names. */
+      resolveUploads: (input: { keys: string[]; mode: 'replace' | 'keepBoth' }) => Promise<any>;
       previewText: (input: {
         driveItemId: string;
       }) => Promise<{ text: string; truncated: boolean }>;

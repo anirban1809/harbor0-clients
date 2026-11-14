@@ -127,3 +127,8 @@ export function conflictName(name: string, device: string, operationId: string) 
       .slice(0, 40) || 'another device';
   return `${path.basename(name, ext)} (Conflict - ${label} - ${operationId.slice(0, 8)})${ext}`;
 }
+/** “Report.pdf” → “Report (2).pdf”, as the web names a kept-both upload. */
+export function numberedName(name: string, n: number) {
+  const dot = name.lastIndexOf('.');
+  return dot > 0 ? `${name.slice(0, dot)} (${n})${name.slice(dot)}` : `${name} (${n})`;
+}

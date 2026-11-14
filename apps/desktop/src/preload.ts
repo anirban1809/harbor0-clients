@@ -23,6 +23,7 @@ const channels = [
   'rootSettings',
   'pause',
   'upload',
+  'resolveUploads',
   'download',
   'previewText',
   'previewPdf',

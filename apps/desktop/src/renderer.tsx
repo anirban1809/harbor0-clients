@@ -1460,6 +1460,10 @@ function App() {
                 const finished = finishedKeys(uploads);
                 setUploads((old) => old.filter((u) => !finished.has(u.key)));
               }}
+              onReplace={(keys) => void act(() => bridge.resolveUploads({ keys, mode: 'replace' }))}
+              onKeepBoth={(keys) =>
+                void act(() => bridge.resolveUploads({ keys, mode: 'keepBoth' }))
+              }
             />
             {section !== 'My Drive' && section !== 'Photos' && (
               <div className={`page-heading ${section === 'Shared' ? 'shared-heading' : ''}`}>
