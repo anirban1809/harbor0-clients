@@ -354,6 +354,8 @@ function Workspace() {
   const me = useQuery({
     queryKey: ['me'],
     queryFn: () => api.me(),
+    // While a large deleted folder's size is coming off, follow it on the storage meter.
+    refetchInterval: (query) => (query.state.data?.storage?.freeing ? 3000 : false),
     refetchOnWindowFocus: (query) => query.state.data !== undefined,
     refetchOnReconnect: (query) => query.state.data !== undefined,
   });

@@ -62,6 +62,38 @@ export function UpgradeBanner({ onUpgrade }: { onUpgrade: () => void }) {
   );
 }
 
+/**
+ * A large deleted folder's size comes off the meter as the server counts it. With the folder's
+ * size from an earlier count the bar fills toward it; without one it just shows activity.
+ */
+function FreeingProgress({ freeing }: { freeing: NonNullable<StorageUsage['freeing']> }) {
+  const total = freeing.estimatedBytes;
+  const percent = total ? Math.min(100, Math.round((freeing.bytes / total) * 100)) : null;
+  return (
+    <div className="drive-storage-freeing" role="status">
+      <div className="drive-storage-heading">
+        <span>Freeing up space</span>
+        {percent !== null && <span>{percent}%</span>}
+      </div>
+      <div
+        className="progress-track"
+        data-indeterminate={percent === null}
+        role="progressbar"
+        aria-label="Freeing up space"
+        aria-valuemin={0}
+        aria-valuemax={100}
+        aria-valuenow={percent ?? undefined}
+      >
+        <span style={percent === null ? undefined : { width: `${percent}%` }} />
+      </div>
+      <p>
+        {fileSize(freeing.bytes)}
+        {total ? ` of ${fileSize(total)}` : ' freed so far'}
+      </p>
+    </div>
+  );
+}
+
 export function StorageIndicator({
   storage,
   onManage,
@@ -106,6 +138,7 @@ export function StorageIndicator({
               )}
             </p>
           )}
+          {storage.freeing && <FreeingProgress freeing={storage.freeing} />}
         </>
       ) : (
         <Button variant="link" onClick={onRetry}>

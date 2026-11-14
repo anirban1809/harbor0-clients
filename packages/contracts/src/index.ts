@@ -294,6 +294,9 @@ export const storageSchema = z.object({
   availableBytes: z.number(),
   // Part of `usedBytes`: files in the trash, which still count until the trash is emptied.
   trashBytes: z.number().optional(),
+  // Large deleted folders whose size is still coming off `usedBytes`: the bytes freed so far, and
+  // what they held at an earlier count (null when never counted). Missing when nothing is.
+  freeing: z.object({ bytes: z.number(), estimatedBytes: z.number().nullable() }).optional(),
 });
 // One stored file version, the unit storage is charged in. `countedBytes` is what the version
 // adds to `usedBytes` (0 for legacy content held only on synced devices).
@@ -453,13 +456,36 @@ export type TwoFactorChallenge = z.infer<typeof twoFactorChallengeSchema>;
 export type TotpSetup = z.infer<typeof totpSetupSchema>;
 export type BetaStatus = z.infer<typeof betaStatusSchema>;
 export type AccessRequestResult = z.infer<typeof accessRequestResultSchema>;
-export const storageUsage = (u: User & { trashBytes?: number }): StorageUsage => ({
-  quotaBytes: u.storageQuotaBytes,
-  usedBytes: u.storageUsedBytes,
-  reservedBytes: u.storageReservedBytes,
-  availableBytes: Math.max(0, u.storageQuotaBytes - u.storageUsedBytes - u.storageReservedBytes),
-  trashBytes: Math.max(0, u.trashBytes ?? 0),
-});
+/** A freeing entry not updated for this long belongs to a measure that stopped; it is ignored. */
+export const FREEING_STALE_MS = 15 * 60_000;
+type FreeingEntry = { bytes: number; estimatedBytes?: number; updatedAt: string };
+const freeingTotal = (entries: Record<string, FreeingEntry> = {}, at = Date.now()) => {
+  const live = Object.values(entries).filter(
+    (e) => at - Date.parse(e.updatedAt) < FREEING_STALE_MS,
+  );
+  if (!live.length) return undefined;
+  const estimated = live.every((e) => e.estimatedBytes !== undefined);
+  return {
+    bytes: live.reduce((sum, e) => sum + e.bytes, 0),
+    // Only a total for every folder makes a whole; a measure can pass a stale count.
+    estimatedBytes: estimated
+      ? live.reduce((sum, e) => sum + Math.max(e.bytes, e.estimatedBytes!), 0)
+      : null,
+  };
+};
+export const storageUsage = (
+  u: User & { trashBytes?: number; freeing?: Record<string, FreeingEntry> },
+): StorageUsage => {
+  const freeing = freeingTotal(u.freeing);
+  return {
+    quotaBytes: u.storageQuotaBytes,
+    usedBytes: u.storageUsedBytes,
+    reservedBytes: u.storageReservedBytes,
+    availableBytes: Math.max(0, u.storageQuotaBytes - u.storageUsedBytes - u.storageReservedBytes),
+    trashBytes: Math.max(0, u.trashBytes ?? 0),
+    ...(freeing ? { freeing } : {}),
+  };
+};
 
 export const folderDownloadSchema = z.object({
   id: z.string(),

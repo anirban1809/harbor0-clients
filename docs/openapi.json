@@ -6738,6 +6738,24 @@
                         },
                         "trashBytes": {
                           "type": "number"
+                        },
+                        "freeing": {
+                          "type": "object",
+                          "properties": {
+                            "bytes": {
+                              "type": "number"
+                            },
+                            "estimatedBytes": {
+                              "type": [
+                                "number",
+                                "null"
+                              ]
+                            }
+                          },
+                          "required": [
+                            "bytes",
+                            "estimatedBytes"
+                          ]
                         }
                       },
                       "required": [
@@ -7883,6 +7901,24 @@
                         },
                         "trashBytes": {
                           "type": "number"
+                        },
+                        "freeing": {
+                          "type": "object",
+                          "properties": {
+                            "bytes": {
+                              "type": "number"
+                            },
+                            "estimatedBytes": {
+                              "type": [
+                                "number",
+                                "null"
+                              ]
+                            }
+                          },
+                          "required": [
+                            "bytes",
+                            "estimatedBytes"
+                          ]
                         }
                       },
                       "required": [
@@ -33308,6 +33344,24 @@
                         },
                         "trashBytes": {
                           "type": "number"
+                        },
+                        "freeing": {
+                          "type": "object",
+                          "properties": {
+                            "bytes": {
+                              "type": "number"
+                            },
+                            "estimatedBytes": {
+                              "type": [
+                                "number",
+                                "null"
+                              ]
+                            }
+                          },
+                          "required": [
+                            "bytes",
+                            "estimatedBytes"
+                          ]
                         }
                       },
                       "required": [

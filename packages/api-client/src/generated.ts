@@ -6033,6 +6033,10 @@ export interface operations {
                             reservedBytes: number;
                             availableBytes: number;
                             trashBytes?: number;
+                            freeing?: {
+                                bytes: number;
+                                estimatedBytes: number | null;
+                            };
                         };
                         flags: {
                             [key: string]: boolean;
@@ -6468,6 +6472,10 @@ export interface operations {
                             reservedBytes: number;
                             availableBytes: number;
                             trashBytes?: number;
+                            freeing?: {
+                                bytes: number;
+                                estimatedBytes: number | null;
+                            };
                         };
                         nextCursor: string | null;
                     };
@@ -16393,6 +16401,10 @@ export interface operations {
                             reservedBytes: number;
                             availableBytes: number;
                             trashBytes?: number;
+                            freeing?: {
+                                bytes: number;
+                                estimatedBytes: number | null;
+                            };
                         };
                     };
                 };

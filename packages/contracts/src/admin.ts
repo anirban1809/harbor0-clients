@@ -275,6 +275,14 @@ export const platformCostsSchema = z.object({
     reconstructedDays: z.number(),
   }),
   daily: z.array(z.object({ date: z.string(), awsUsd: z.number(), r2Usd: z.number() })),
+  /**
+   * The newest month AWS has invoiced (YYYY-MM), treated as paid once issued; the amount
+   * includes tax. Null before the first invoice or when invoices could not be read.
+   */
+  lastBill: z
+    .object({ period: z.string(), issuedAt: z.string(), usd: z.number() })
+    .nullable()
+    .default(null),
 });
 export const adminOverviewSchema = z.object({
   estimatedUsers: z.number().nullable(),
