@@ -7,6 +7,7 @@
 //   npm run release:desktop -- --test       a test build of the next patch version, such as 0.1.9-test
 //                                           (then 0.1.9-test.2, …); takes minor, major or x.y.z too
 //   npm run release:desktop -- --test --linux  a test build that also has the Linux packages
+//   npm run release:desktop -- --no-windows  leave Windows out: its apps and download stay as they are
 //
 // Releases always have Linux packages, built in Docker: AppImage, deb and rpm for x64, and AppImage
 // and deb for arm64. Linux apps don't update themselves; people install new versions by hand.
@@ -39,6 +40,8 @@ const args = process.argv.slice(2);
 const dryRun = args.includes('--dry-run');
 const testBuild = args.includes('--test');
 const linux = !testBuild || args.includes('--linux');
+// Windows apps find no installer for their platform in the feed, so they stay on their version.
+const windows = !args.includes('--no-windows');
 const bump = args.find((arg) => !arg.startsWith('--')) ?? 'patch';
 // The notarytool keychain profile electron-builder notarizes the Mac app with. Create it once with
 // `xcrun notarytool store-credentials harbor0-notary --key <AuthKey.p8> --key-id … --issuer …`.
@@ -260,13 +263,17 @@ const targets = [
     name: `harbor0-${version}-mac-arm64.dmg`,
     build: ['--mac', 'dmg', '--arm64'],
   },
-  {
-    key: 'windows',
-    platform: 'Windows',
-    architecture: 'x64',
-    name: `harbor0-${version}-win-x64.exe`,
-    build: ['--win', 'nsis', '--x64'],
-  },
+  ...(windows
+    ? [
+        {
+          key: 'windows',
+          platform: 'Windows',
+          architecture: 'x64',
+          name: `harbor0-${version}-win-x64.exe`,
+          build: ['--win', 'nsis', '--x64'],
+        },
+      ]
+    : []),
   // One Linux build per architecture makes all of its packages.
   ...(linux
     ? [
