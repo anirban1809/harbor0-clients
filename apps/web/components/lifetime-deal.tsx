@@ -11,6 +11,8 @@ import { Badge } from './ui/badge';
 import { Button } from './ui/button';
 import { Card } from './ui/card';
 import { Dialog, DialogActions } from './ui/dialog';
+import { Field } from './ui/field';
+import { Input } from './ui/input';
 
 /** What `GET /v1/billing/lifetime` returns; amounts are in cents. */
 type LifetimeOffer = {
@@ -23,6 +25,8 @@ type LifetimeOffer = {
   maxTerabytes: number;
   prices: { terabytes: number; storageBytes: number; amount: number }[];
   currency: string;
+  /** More TB for the account's seat, any whole number at one price a TB; null without a seat. */
+  addOn: { amountPerTerabyte: number; maxTerabytes: number } | null;
   owned: LifetimeSeat | null;
   /** The 1–5 TB seats are open to this account (`lifetime-deal`). */
   seatsOpen: boolean;
@@ -30,13 +34,24 @@ type LifetimeOffer = {
   invited: { terabytes: number; storageBytes: number; amount: number } | null;
   checkoutAvailable: boolean;
 };
-type LifetimePrice = LifetimeOffer['prices'][number];
-/** The sizes this account can buy: the 500 GB plan when invited, then the seats while open. */
-const choices = (offer: LifetimeOffer): LifetimePrice[] => [
-  ...(offer.invited ? [offer.invited] : []),
-  ...(offer.seatsOpen && !offer.soldOut ? offer.prices : []),
-];
-const kind = (terabytes: number) => (terabytes < 1 ? 'lifetime storage' : 'lifetime seat');
+type LifetimePrice = { terabytes: number; storageBytes: number; amount: number };
+const ownedSeat = (offer: LifetimeOffer) =>
+  offer.owned && !offer.owned.refundedAt ? offer.owned : undefined;
+/**
+ * What this account can buy: with nothing yet, the 500 GB plan when invited and the seats while
+ * open. With stacking on (`ltd-stacking`), more TB for its seat, or a seat on top of its 500 GB.
+ */
+const choices = (offer: LifetimeOffer, stacking: boolean): LifetimePrice[] => {
+  const owned = ownedSeat(offer);
+  if (owned && !stacking) return [];
+  // Any number of TB: the dialog asks how many, starting from 1.
+  if (owned?.seat)
+    return offer.addOn
+      ? [{ terabytes: 1, storageBytes: 1e12, amount: offer.addOn.amountPerTerabyte }]
+      : [];
+  const seats = offer.seatsOpen && !offer.soldOut ? offer.prices : [];
+  return owned ? seats : [...(offer.invited ? [offer.invited] : []), ...seats];
+};
 
 export function useLifetimeOffer(api: ApiClient, enabled = true) {
   return useQuery({
@@ -59,6 +74,7 @@ const seatsLine = (offer: LifetimeOffer) =>
 export function LifetimeCard({ api }: { api: ApiClient }) {
   const seatsOn = useFeatureFlag('lifetime-deal');
   const invitedOn = useFeatureFlag('lifetime-500');
+  const stacking = useFeatureFlag('ltd-stacking');
   const enabled = seatsOn || invitedOn;
   const cache = useQueryClient();
   const router = useRouter();
@@ -80,7 +96,7 @@ export function LifetimeCard({ api }: { api: ApiClient }) {
       .then(({ terabytes }: { terabytes: number | null }) => {
         setNotice(
           terabytes
-            ? `Thanks! Your ${lifetimeSize(terabytes)} of ${kind(terabytes)} is active.`
+            ? `Thanks! You now have ${lifetimeSize(terabytes)} of lifetime storage.`
             : 'Your payment is still processing. Your lifetime storage appears here in a minute or two.',
         );
         void cache.invalidateQueries({ queryKey: ['billing'] });
@@ -90,8 +106,8 @@ export function LifetimeCard({ api }: { api: ApiClient }) {
   }, [enabled, searchParams]);
 
   if (!enabled || !offer.data) return null;
-  const owned = offer.data.owned && !offer.data.owned.refundedAt ? offer.data.owned : undefined;
-  const options = choices(offer.data);
+  const owned = ownedSeat(offer.data);
+  const options = choices(offer.data, stacking);
   const from = options[0];
   // Invited with seats closed, or seats closed and nothing bought: nothing to show.
   if (!owned && !offer.data.seatsOpen && !offer.data.invited) return null;
@@ -109,16 +125,17 @@ export function LifetimeCard({ api }: { api: ApiClient }) {
             : `Pay once and keep the storage for as long as harbor0 runs. ${options.length > 1 ? 'From' : 'It’s'} ${money(from.amount, offer.data.currency)} for ${lifetimeSize(from.terabytes)}.${offer.data.seatsOpen ? ` ${seatsLine(offer.data)}` : ''}`
       }
       action={
-        owned ? (
-          <Badge tone="success">Active</Badge>
+        from && offer.data.checkoutAvailable ? (
+          <Button variant="outline" onClick={() => setOpen(true)}>
+            <Lifetime aria-hidden="true" />
+            {owned
+              ? 'Add storage'
+              : offer.data.seatsOpen
+                ? 'See lifetime seats'
+                : 'See lifetime storage'}
+          </Button>
         ) : (
-          from &&
-          offer.data.checkoutAvailable && (
-            <Button variant="outline" onClick={() => setOpen(true)}>
-              <Lifetime aria-hidden="true" />
-              {offer.data.seatsOpen ? 'See lifetime seats' : 'See lifetime storage'}
-            </Button>
-          )
+          owned && <Badge tone="success">Active</Badge>
         )
       }
     >
@@ -127,7 +144,14 @@ export function LifetimeCard({ api }: { api: ApiClient }) {
           {notice}
         </Alert>
       )}
-      {open && <LifetimeDialog api={api} offer={offer.data} onClose={() => setOpen(false)} />}
+      {open && (
+        <LifetimeDialog
+          api={api}
+          offer={offer.data}
+          options={options}
+          onClose={() => setOpen(false)}
+        />
+      )}
     </Card>
   );
 }
@@ -136,21 +160,33 @@ export function LifetimeCard({ api }: { api: ApiClient }) {
 function LifetimeDialog({
   api,
   offer,
+  options,
   onClose,
 }: {
   api: ApiClient;
   offer: LifetimeOffer;
+  /** What the account can buy (`choices`); never empty. */
+  options: LifetimePrice[];
   onClose: () => void;
 }) {
-  const options = choices(offer);
+  const owned = ownedSeat(offer);
+  // More TB for an existing seat: no seat to hold, one price a TB.
+  const addingOn = !!owned?.seat;
   const [terabytes, setTerabytes] = useState(options[0].terabytes);
+  // What's typed in the add-on's TB box, which may be empty or out of range while typing.
+  const [typed, setTyped] = useState('1');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
-  const chosen = options.find((p) => p.terabytes === terabytes)!;
+  const most = offer.addOn?.maxTerabytes ?? 0;
+  const count = Number(typed);
+  const valid = !addingOn || (Number.isInteger(count) && count >= 1 && count <= most);
+  const chosen = addingOn
+    ? { terabytes: valid ? count : 1, amount: (valid ? count : 1) * offer.addOn!.amountPerTerabyte }
+    : options.find((p) => p.terabytes === terabytes)!;
   const extra = offer.prices[1] ? offer.prices[1].amount - offer.prices[0].amount : 0;
   // The 500 GB plan holds no seat, so seats in other checkouts don't block it.
-  const held = offer.allHeld && chosen.terabytes >= 1;
-  const seatsOpen = offer.seatsOpen && !offer.soldOut;
+  const held = !addingOn && offer.allHeld && chosen.terabytes >= 1;
+  const seatsOpen = !addingOn && offer.seatsOpen && !offer.soldOut;
 
   const checkout = async () => {
     setBusy(true);
@@ -158,7 +194,7 @@ function LifetimeDialog({
     try {
       const { checkoutUrl } = await api.request('/v1/billing/lifetime/checkout', {
         method: 'POST',
-        body: { terabytes },
+        body: { terabytes: chosen.terabytes },
       });
       window.location.assign(checkoutUrl);
     } catch (e) {
@@ -171,15 +207,20 @@ function LifetimeDialog({
     <Dialog
       open
       onOpenChange={(value) => !value && !busy && onClose()}
-      title="Lifetime storage"
-      description={`One payment, every feature, for as long as harbor0 runs. ${[
-        offer.invited &&
-          `${money(offer.invited.amount, offer.currency)} for ${lifetimeSize(offer.invited.terabytes)}.`,
-        seatsOpen &&
-          `${money(offer.prices[0].amount, offer.currency)} for 1 TB, then ${money(extra, offer.currency)} for each extra TB, up to ${offer.maxTerabytes} TB. ${seatsLine(offer)}`,
-      ]
-        .filter(Boolean)
-        .join(' ')}`}
+      title={addingOn ? 'Add lifetime storage' : 'Lifetime storage'}
+      description={
+        addingOn
+          ? `Add as much as you like to your ${lifetimeSize(owned!.terabytes)} lifetime seat, at ${money(offer.addOn!.amountPerTerabyte, offer.currency)} for each TB. One payment, kept for as long as harbor0 runs.`
+          : `One payment, every feature, for as long as harbor0 runs. ${[
+              !owned &&
+                offer.invited &&
+                `${money(offer.invited.amount, offer.currency)} for ${lifetimeSize(offer.invited.terabytes)}.`,
+              seatsOpen &&
+                `${money(offer.prices[0].amount, offer.currency)} for 1 TB, then ${money(extra, offer.currency)} for each extra TB, up to ${offer.maxTerabytes} TB. ${seatsLine(offer)}`,
+            ]
+              .filter(Boolean)
+              .join(' ')}`
+      }
     >
       <div className="form">
         {error && <Alert tone="error">{error}</Alert>}
@@ -189,30 +230,60 @@ function LifetimeDialog({
             again within 30 minutes.
           </Alert>
         )}
-        <fieldset className="choice-list plan-choices">
-          <legend className="sr-only">Storage</legend>
-          {options.map((price) => (
-            <label className="choice" key={price.terabytes}>
-              <input
-                type="radio"
-                className="radio"
-                name="lifetime-size"
-                value={price.terabytes}
-                disabled={busy}
-                checked={terabytes === price.terabytes}
-                onChange={() => setTerabytes(price.terabytes)}
-              />
-              <span>
-                <strong>
-                  {lifetimeSize(price.terabytes)} · {money(price.amount, offer.currency)}
-                </strong>
-                <span className="muted">One payment</span>
-              </span>
-            </label>
-          ))}
-        </fieldset>
+        {addingOn ? (
+          <Field
+            label="Storage to add, in TB"
+            hint={
+              valid
+                ? `${money(chosen.amount, offer.currency)}, one payment`
+                : `Enter a whole number of TB, from 1 to ${most}.`
+            }
+          >
+            <Input
+              type="number"
+              inputMode="numeric"
+              min={1}
+              max={most}
+              step={1}
+              value={typed}
+              disabled={busy}
+              aria-invalid={!valid}
+              onChange={(e) => setTyped(e.target.value)}
+            />
+          </Field>
+        ) : (
+          <fieldset className="choice-list plan-choices">
+            <legend className="sr-only">Storage</legend>
+            {options.map((price) => (
+              <label className="choice" key={price.terabytes}>
+                <input
+                  type="radio"
+                  className="radio"
+                  name="lifetime-size"
+                  value={price.terabytes}
+                  disabled={busy}
+                  checked={terabytes === price.terabytes}
+                  onChange={() => setTerabytes(price.terabytes)}
+                />
+                <span>
+                  <strong>
+                    {lifetimeSize(price.terabytes)} · {money(price.amount, offer.currency)}
+                  </strong>
+                  <span className="muted">One payment</span>
+                </span>
+              </label>
+            ))}
+          </fieldset>
+        )}
         <ul className="muted lifetime-terms">
-          <li>One lifetime purchase per account. It can’t be moved to another account.</li>
+          {addingOn ? (
+            <li>It adds to your seat and stays with this account. It can’t be moved.</li>
+          ) : (
+            <li>
+              One lifetime seat per account, and you can add storage to it later. It can’t be moved
+              to another account.
+            </li>
+          )}
           <li>The storage adds to any plan you have, now or later.</li>
           <li>Version history and trash count toward it, as on every plan.</li>
           <li>Discount codes don’t apply. Sales tax or VAT may be added at checkout.</li>
@@ -221,10 +292,12 @@ function LifetimeDialog({
           <Button type="button" variant="outline" disabled={busy} onClick={onClose}>
             Close
           </Button>
-          <Button type="button" disabled={busy || held} onClick={() => void checkout()}>
+          <Button type="button" disabled={busy || held || !valid} onClick={() => void checkout()}>
             {busy
               ? 'Opening checkout…'
-              : `Buy ${lifetimeSize(chosen.terabytes)} for ${money(chosen.amount, offer.currency)}`}
+              : !valid
+                ? 'Add storage'
+                : `${addingOn ? 'Add' : 'Buy'} ${lifetimeSize(chosen.terabytes)} for ${money(chosen.amount, offer.currency)}`}
           </Button>
         </DialogActions>
       </div>

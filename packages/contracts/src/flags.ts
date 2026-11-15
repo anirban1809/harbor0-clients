@@ -98,6 +98,13 @@ export const featureFlags = {
       CHECKOUT_STARTED: 'Opened 500 GB lifetime checkout',
     },
   },
+  'ltd-stacking': {
+    description:
+      'Buying more lifetime storage on top: seat holders add any number of TB at the price per TB set on the Overview page (no seat used, no limit), and 500 GB holders can buy a seat. Storage already added stays if the flag goes off.',
+    usage: {
+      CHECKOUT_STARTED: 'Opened checkout to add lifetime storage',
+    },
+  },
 } as const satisfies Record<string, FlagDefinition>;
 type FlagDefinition = {
   /** What staff see for it in the console. */

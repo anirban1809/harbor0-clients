@@ -3058,7 +3058,7 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** Hold a lifetime seat and start its payment page */
+        /** Hold a lifetime seat and start its payment page; an account with a seat adds TB to it */
         post: operations["post__v1_billing_lifetime_checkout"];
         delete?: never;
         options?: never;
@@ -40803,6 +40803,10 @@ export interface operations {
                             amount: number;
                         }[];
                         currency: string;
+                        addOn: {
+                            amountPerTerabyte: number;
+                            maxTerabytes: number;
+                        } | null;
                         owned: {
                             seat: number;
                             terabytes: number;

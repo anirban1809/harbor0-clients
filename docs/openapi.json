@@ -92306,6 +92306,28 @@
                     "currency": {
                       "type": "string"
                     },
+                    "addOn": {
+                      "anyOf": [
+                        {
+                          "type": "object",
+                          "properties": {
+                            "amountPerTerabyte": {
+                              "type": "number"
+                            },
+                            "maxTerabytes": {
+                              "type": "number"
+                            }
+                          },
+                          "required": [
+                            "amountPerTerabyte",
+                            "maxTerabytes"
+                          ]
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    },
                     "owned": {
                       "anyOf": [
                         {
@@ -92384,6 +92406,7 @@
                     "maxTerabytes",
                     "prices",
                     "currency",
+                    "addOn",
                     "owned",
                     "seatsOpen",
                     "invited",
@@ -92722,7 +92745,7 @@
     },
     "/v1/billing/lifetime/checkout": {
       "post": {
-        "summary": "Hold a lifetime seat and start its payment page",
+        "summary": "Hold a lifetime seat and start its payment page; an account with a seat adds TB to it",
         "operationId": "post__v1_billing_lifetime_checkout",
         "security": [
           {
@@ -92743,7 +92766,7 @@
                       {
                         "type": "integer",
                         "minimum": 1,
-                        "maximum": 5
+                        "maximum": 1000
                       },
                       {
                         "type": "number",
