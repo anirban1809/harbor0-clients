@@ -105,6 +105,15 @@ export const featureFlags = {
       CHECKOUT_STARTED: 'Opened checkout to add lifetime storage',
     },
   },
+  'support-system': {
+    description:
+      'Support page on the web: people open requests (questions, problems, feature requests) and staff answer them on the console Support page. Requests already open stay readable in the console if the flag goes off.',
+    usage: {
+      TICKET_CREATED: 'Opened a support request',
+      REPLIED: 'Wrote on a support request',
+      CLOSED: 'Closed a support request',
+    },
+  },
 } as const satisfies Record<string, FlagDefinition>;
 type FlagDefinition = {
   /** What staff see for it in the console. */

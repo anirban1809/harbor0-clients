@@ -10,6 +10,7 @@ export const workspaceRoutes = {
   Storage: '/storage',
   Settings: '/settings',
   Notifications: '/notifications',
+  Support: '/support',
 } as const;
 
 export type WorkspaceSection = keyof typeof workspaceRoutes;
@@ -100,5 +101,9 @@ export function loginDestination(path: string | null): string {
   if (route === '/storage' && plan && /^\w{1,16}$/.test(plan))
     return `/storage?${new URLSearchParams({ plan, interval: params.get('interval') === 'month' ? 'month' : 'year' })}`;
   if (route === '/settings' && params.get('tab') === 'billing') return '/settings?tab=billing';
+  // Support emails link to one request.
+  const ticket = params.get('id');
+  if (route === '/support' && ticket && /^[0-9A-Z]{8}$/.test(ticket))
+    return `/support?id=${ticket}`;
   return route ?? '/drive';
 }

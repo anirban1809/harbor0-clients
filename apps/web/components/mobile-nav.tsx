@@ -7,6 +7,7 @@ import {
   HardDrive,
   Images,
   LayoutPanelTop,
+  LifeBuoy,
   Laptop,
   Menu,
   Settings,
@@ -31,6 +32,7 @@ const more: { name: WorkspaceSection; icon: LucideIcon; hint: string }[] = [
   { name: 'Devices', icon: Laptop, hint: 'Computers and phones signed in' },
   { name: 'Storage', icon: Cloud, hint: 'Usage and plan' },
   { name: 'Settings', icon: Settings, hint: 'Profile and appearance' },
+  { name: 'Support', icon: LifeBuoy, hint: 'Questions, problems and ideas' },
 ];
 
 /** Phone navigation: a bottom tab bar, with the less frequent pages in a “More” sheet. */
@@ -52,6 +54,7 @@ export function MobileTabBar({
   const [open, setOpen] = useState(false);
   const photosOn = useFeatureFlag('photos');
   const roomsOn = useFeatureFlag('client-rooms');
+  const supportOn = useFeatureFlag('support-system');
   const inMore = !tabs.some((tab) => tab.name === section);
   return (
     <>
@@ -84,6 +87,7 @@ export function MobileTabBar({
           {more
             .filter(({ name }) => name !== 'Photos' || photosOn)
             .filter(({ name }) => name !== 'Data rooms' || roomsOn)
+            .filter(({ name }) => name !== 'Support' || supportOn)
             .map(({ name, icon: Icon, hint }) => (
               <Link
                 key={name}

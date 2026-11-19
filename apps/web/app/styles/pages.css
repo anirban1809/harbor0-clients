@@ -2047,3 +2047,148 @@
   font-size: var(--text-sm);
   line-height: 1.5;
 }
+
+/* Support: the request list and one request's thread. */
+.support-page {
+  display: grid;
+  gap: 16px;
+  max-width: 880px;
+}
+.support-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+.support-toolbar p {
+  margin: 0;
+}
+.support-meta {
+  display: block;
+  font-size: 12px;
+  color: var(--text-3);
+}
+.support-back {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  width: fit-content;
+  font-size: 13px;
+  color: var(--text-2);
+  text-decoration: none;
+}
+.support-back:hover {
+  color: var(--foreground);
+}
+.support-back svg {
+  width: 15px;
+  height: 15px;
+}
+.support-heading h2 {
+  margin: 0 0 8px;
+  font-size: 20px;
+  font-weight: 650;
+  letter-spacing: -0.01em;
+  overflow-wrap: anywhere;
+}
+.support-badges {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  font-size: 13px;
+}
+.support-thread {
+  display: grid;
+  gap: 10px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.support-message {
+  padding: 14px 16px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-lg);
+  background: var(--card);
+}
+.support-message[data-author='STAFF'] {
+  border-color: color-mix(in oklab, var(--primary) 30%, var(--line));
+  background: var(--accent-soft);
+}
+.support-message-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 6px;
+  font-size: 13px;
+}
+.support-message p {
+  margin: 0;
+  font-size: 14px;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.support-reply-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+.support-kind-hint {
+  display: block;
+  font-size: 12px;
+}
+.support-shots {
+  display: grid;
+  gap: 10px;
+}
+.support-shot-add {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  font-size: 12px;
+}
+.support-shot-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.support-message .support-shot-list {
+  margin-top: 10px;
+}
+.support-shot {
+  position: relative;
+  width: 96px;
+  height: 72px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  overflow: hidden;
+  background: var(--fill-1);
+}
+.support-shot a {
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+.support-shot img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+.support-shot-remove {
+  position: absolute;
+  top: 3px;
+  right: 3px;
+  background: color-mix(in oklab, var(--background) 85%, transparent);
+}
+.support-page .file-size-column {
+  width: 150px;
+  white-space: nowrap;
+}

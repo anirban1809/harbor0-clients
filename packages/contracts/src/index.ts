@@ -523,6 +523,7 @@ export * from './media';
 export * from './zip-format';
 export * from './migrations';
 export * from './account-deletion';
+export * from './support';
 /** What a personal access token may do: everything in My Drive, or only list and download. */
 export const accessTokenScope = z.enum(['FULL', 'READ']);
 export type AccessTokenScope = z.infer<typeof accessTokenScope>;

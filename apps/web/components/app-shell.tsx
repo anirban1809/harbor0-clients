@@ -67,6 +67,7 @@ import {
   Images,
   Users,
   LayoutPanelTop,
+  LifeBuoy,
   Laptop,
   Clock,
   RotateCcw,
@@ -112,6 +113,7 @@ import {
 } from './drive-account';
 import { MobileTabBar } from './mobile-nav';
 import { PhotosPage } from './photos-page';
+import { SupportPage } from './support-page';
 import { StorageAudit } from './storage-audit';
 import { Button } from '../components/ui/button';
 import { Dialog, DialogActions } from '../components/ui/dialog';
@@ -234,6 +236,8 @@ const navigation = [
   { name: 'Devices', icon: Laptop },
   { name: 'Storage', icon: Cloud },
   { name: 'Settings', icon: Settings },
+  // Shown only while the support system is on for the account.
+  { name: 'Support', icon: LifeBuoy },
 ];
 function FileGlyph({ item }: { item: Pick<DriveItem, 'type' | 'mimeType'> }) {
   const Icon =
@@ -378,6 +382,7 @@ function Workspace() {
   const publicLinksOn = me.data?.flags?.['public-links'] === true;
   const clientRoomsOn = me.data?.flags?.['client-rooms'] === true;
   const photosOn = me.data?.flags?.photos === true;
+  const supportOn = me.data?.flags?.['support-system'] === true;
   // A ZIP archive opened like a folder, from the drive page of the folder that holds it.
   const zipPreview = me.data?.flags?.['zip-preview'] === true;
   const settingsTab: SettingsTab =
@@ -460,7 +465,8 @@ function Workspace() {
               pathname === '/backups' ||
               pathname === '/rooms' ||
               pathname === '/storage' ||
-              pathname === '/settings'
+              pathname === '/settings' ||
+              pathname === '/support'
             ? `${pathname}${searchParams.size ? `?${searchParams}` : ''}`
             : section === 'Shared'
               ? sharedHref(sharedTab)
@@ -1328,6 +1334,7 @@ function Workspace() {
           {navigation
             .filter(({ name }) => name !== 'Photos' || photosOn)
             .filter(({ name }) => name !== 'Data rooms' || clientRoomsOn)
+            .filter(({ name }) => name !== 'Support' || supportOn)
             .map(({ name, icon: Icon }) => (
               <Link
                 href={workspaceRoutes[name as WorkspaceSection]}
@@ -1967,6 +1974,9 @@ function Workspace() {
               onOpenGroup={(key) => router.push(placeHref(place, key))}
               onOpenFolder={(key, folderId) => router.push(placeHref(place, key, folderId))}
             />
+          )}
+          {section === 'Support' && !searching && supportOn && (
+            <SupportPage request={api.request} ticketId={searchParams.get('id')} />
           )}
           {section === 'Data rooms' && !searching && clientRoomsOn && (
             <ClientRoomsList request={api.request} onBrowse={() => navigate('My Drive')} />
