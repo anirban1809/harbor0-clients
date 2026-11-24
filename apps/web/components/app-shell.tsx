@@ -35,6 +35,7 @@ import { loadFolderTrail } from '../lib/folder-navigation';
 import { useDebouncedValue } from '../lib/use-debounced-value';
 import { downloadFolderZip } from '../lib/folder-download';
 import { ZipDownloadStatusPanel, type ZipDownloadStatus } from './zip-download-status';
+import { FileDownloadStatusPanel, type FileDownloadStatus } from './file-download-status';
 import { ZipFolder } from './zip-folder';
 import { isZip } from '../lib/zip-drive';
 import { BrandLogo } from '../components/brand-logo';
@@ -141,7 +142,13 @@ import { registerBrowser } from '../lib/device-key';
 import { guardTransport, setSignedIn, useSessionEnd } from '../lib/session-guard';
 import { e2eeTransport } from '../lib/e2ee-transport';
 import { currentVault, lock, restore as restoreVault, useVault } from '../lib/e2ee-vault';
-import { encryptedPreview, isEncrypted, saveEncrypted } from '../lib/e2ee-files';
+import {
+  encryptedPreview,
+  isEncrypted,
+  pickSaveFolder,
+  saveEncrypted,
+  type SaveFolder,
+} from '../lib/e2ee-files';
 import { LINK_SYNC_MS, syncAllLinks } from '../lib/e2ee-links';
 import { INBOX_SYNC_MS, syncRequestInbox } from '../lib/e2ee-requests';
 import { startDecryption, startMigration, useMigrationProgress } from '../lib/e2ee-migration';
@@ -338,6 +345,9 @@ function Workspace() {
   const [zipProgress, setZipProgress] = useState<ZipDownloadStatus | null>(null);
   const zipJob = useRef<AbortController | null>(null);
   useEffect(() => () => zipJob.current?.abort(), []);
+  const [fileProgress, setFileProgress] = useState<FileDownloadStatus | null>(null);
+  const fileJob = useRef<AbortController | null>(null);
+  useEffect(() => () => fileJob.current?.abort(), []);
   const [cursor, setCursor] = useState<string>();
   const [progress, setProgress] = useState<FileUpload[]>([]);
   const [online, setOnline] = useState(true);
@@ -821,7 +831,8 @@ function Workspace() {
       if (currentVault().enabled && data.driveItemId) {
         const { item } = await api.request(`/v1/drive/items/${data.driveItemId}`);
         try {
-          if (await saveEncrypted(api, item, data.versionId)) return;
+          await saveEncrypted(api, item, { versionId: data.versionId });
+          return;
         } catch (e) {
           if (!(e instanceof E2eeError && e.code === 'CORRUPT')) throw e;
         }
@@ -835,6 +846,56 @@ function Workspace() {
       a.click();
       a.remove();
     });
+  }
+  /**
+   * Downloads files one after another with progress. Several encrypted files are saved into one
+   * folder the person picks, where the browser can, instead of a download each.
+   */
+  async function downloadFiles(items: DriveItem[]) {
+    if (fileJob.current) return;
+    const decrypt = (item: DriveItem) => currentVault().enabled && isEncrypted(item);
+    let folder: SaveFolder | undefined;
+    if (items.filter(decrypt).length > 1) {
+      // Asked first, while the click still lets the browser show a picker.
+      const picked = await pickSaveFolder();
+      if (picked === undefined) return;
+      folder = picked ?? undefined;
+    }
+    const controller = new AbortController();
+    fileJob.current = controller;
+    setError('');
+    let done = 0;
+    try {
+      for (const item of items) {
+        controller.signal.throwIfAborted();
+        setFileProgress({ name: item.name, done, total: items.length, loaded: 0, size: null });
+        if (decrypt(item)) {
+          const saved = await saveEncrypted(api, item, {
+            folder,
+            signal: controller.signal,
+            onProgress: (loaded, size) => setFileProgress((old) => old && { ...old, loaded, size }),
+          });
+          if (!saved) break;
+        } else {
+          const r = await api.download({ driveItemId: item.id });
+          const a = document.createElement('a');
+          a.href = r.downloadUrl;
+          a.rel = 'noreferrer';
+          a.download = '';
+          document.body.append(a);
+          a.click();
+          a.remove();
+        }
+        done++;
+      }
+      if (folder && done) setToast(`Saved ${done} ${done === 1 ? 'file' : 'files'}.`);
+    } catch (e) {
+      if (!controller.signal.aborted) setError((e as Error).message);
+      else if (done) setToast(`Download cancelled after ${done} ${done === 1 ? 'file' : 'files'}.`);
+    } finally {
+      fileJob.current = null;
+      setFileProgress(null);
+    }
   }
   async function downloadFolder(item: DriveItem) {
     if (zipJob.current) return;
@@ -1438,6 +1499,12 @@ function Workspace() {
               </Alert>
             )}
           </div>
+          {fileProgress && (
+            <FileDownloadStatusPanel
+              progress={fileProgress}
+              onCancel={() => fileJob.current?.abort()}
+            />
+          )}
           {zipProgress && (
             <ZipDownloadStatusPanel
               progress={zipProgress}
@@ -1560,6 +1627,7 @@ function Workspace() {
                   else
                     await download({ driveItemId: item.id, ...(versionId ? { versionId } : {}) });
                 }}
+                onDownloadFiles={downloadFiles}
                 onChanged={() => void refresh(false)}
                 onManageStorage={() => navigate('Storage')}
               />

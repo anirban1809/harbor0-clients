@@ -109,6 +109,8 @@ type Props = {
   onDropFiles: (entries: UploadEntry[]) => Promise<unknown>;
   onUploadFolder?: () => void;
   onDownload: (item: DriveItem, versionId?: string) => Promise<unknown>;
+  /** Several files at once, with progress; without it each file goes through `onDownload`. */
+  onDownloadFiles?: (items: DriveItem[]) => Promise<unknown>;
   /** Choose a file to upload as a new version of `item`. */
   onUploadVersion?: (item: DriveItem) => void;
   onChanged: () => void;
@@ -182,6 +184,7 @@ export function DriveWorkspace({
   onDropFiles,
   onUploadFolder,
   onDownload,
+  onDownloadFiles,
   onUploadVersion,
   onChanged,
   onManageStorage,
@@ -981,13 +984,17 @@ export function DriveWorkspace({
   }
   async function download(targets: Item[]) {
     await run(async () => {
-      for (const item of targets) {
-        if (item.type === 'FILE' && item.cloudState && item.cloudState !== 'AVAILABLE')
-          throw new Error(
-            'This file is stored on linked devices. Open its local copy in the desktop app.',
-          );
-        await onDownload(item);
-      }
+      if (
+        targets.some(
+          (item) => item.type === 'FILE' && item.cloudState && item.cloudState !== 'AVAILABLE',
+        )
+      )
+        throw new Error(
+          'This file is stored on linked devices. Open its local copy in the desktop app.',
+        );
+      const files = onDownloadFiles ? targets.filter((item) => item.type === 'FILE') : [];
+      if (files.length) await onDownloadFiles!(files);
+      for (const item of targets) if (!files.includes(item)) await onDownload(item);
     }, false);
   }
   async function submit(values: Record<string, string>) {

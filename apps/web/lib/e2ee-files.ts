@@ -207,40 +207,104 @@ export async function encryptedPreview(api: ApiClient, item: DriveItem, kind: st
 
 // Larger downloads stream straight to disk where the browser can; others are built in memory.
 const STREAM_ABOVE = 256 * 1024 * 1024;
-type SavePicker = (options: { suggestedName: string }) => Promise<{
-  createWritable: () => Promise<{
-    write: (b: Uint8Array) => Promise<void>;
-    close: () => Promise<void>;
-  }>;
-}>;
+type Writable = {
+  write: (b: Uint8Array) => Promise<void>;
+  close: () => Promise<void>;
+  abort: () => Promise<void>;
+};
+type FileHandle = { createWritable: () => Promise<Writable> };
+type SavePicker = (options: { suggestedName: string }) => Promise<FileHandle>;
+/** A folder the browser lets the page write into (showDirectoryPicker). */
+export type SaveFolder = {
+  getFileHandle: (name: string, options?: { create?: boolean }) => Promise<FileHandle>;
+  removeEntry: (name: string) => Promise<void>;
+};
 
-/** Downloads and decrypts a file in the browser, then saves it under its real name. */
+/**
+ * Asks once for a folder to save several files into, so each is streamed to disk without its own
+ * prompt. Call it straight from a click: browsers only show the picker then. Null where the
+ * browser has no folder picker; undefined when the person closes it.
+ */
+export async function pickSaveFolder(): Promise<SaveFolder | null | undefined> {
+  const picker = (
+    window as unknown as {
+      showDirectoryPicker?: (options: { mode: 'readwrite' }) => Promise<SaveFolder>;
+    }
+  ).showDirectoryPicker;
+  if (!picker) return null;
+  try {
+    return await picker({ mode: 'readwrite' });
+  } catch (e) {
+    if ((e as Error).name === 'AbortError') return undefined;
+    return null;
+  }
+}
+
+/** A file in `folder` named like `name` that isn't there yet: "a.pdf", then "a (1).pdf". */
+async function freshFile(folder: SaveFolder, name: string) {
+  const dot = name.lastIndexOf('.');
+  const [stem, ext] = dot > 0 ? [name.slice(0, dot), name.slice(dot)] : [name, ''];
+  for (let n = 0; ; n++) {
+    const candidate = n ? `${stem} (${n})${ext}` : name;
+    try {
+      await folder.getFileHandle(candidate);
+    } catch (e) {
+      if ((e as Error).name === 'NotFoundError')
+        return { name: candidate, handle: await folder.getFileHandle(candidate, { create: true }) };
+      // A folder by that name: try the next one.
+      if ((e as Error).name !== 'TypeMismatchError') throw e;
+    }
+  }
+}
+
+/**
+ * Downloads and decrypts a file in the browser, then saves it under its real name: into `folder`
+ * when given, else through a save dialog for large files, else as an ordinary download. False
+ * when the person closes the save dialog.
+ */
 export async function saveEncrypted(
   api: ApiClient,
   item: Pick<DriveItem, 'id' | 'name' | 'mimeType'>,
-  versionId?: string,
-  onProgress?: (loaded: number, total: number) => void,
+  options: {
+    versionId?: string;
+    folder?: SaveFolder;
+    signal?: AbortSignal;
+    onProgress?: (loaded: number, total: number) => void;
+  } = {},
 ) {
+  const { versionId, folder, signal, onProgress } = options;
   const reader = await openEncrypted(api, { driveItemId: item.id, versionId });
   const picker = (window as unknown as { showSaveFilePicker?: SavePicker }).showSaveFilePicker;
-  if (picker && reader.size > STREAM_ABOVE) {
-    let handle;
+  let handle: FileHandle | undefined;
+  let saved: string | undefined;
+  if (folder) ({ name: saved, handle } = await freshFile(folder, item.name));
+  else if (picker && reader.size > STREAM_ABOVE) {
     try {
       handle = await picker({ suggestedName: item.name });
-    } catch {
-      return false;
+    } catch (e) {
+      // Closed by the person. Any other refusal (no recent click) saves in memory instead.
+      if ((e as Error).name === 'AbortError') return false;
     }
+  }
+  if (handle) {
     const out = await handle.createWritable();
-    await readAll(
-      reader,
-      (n) => onProgress?.(n, reader.size),
-      undefined,
-      (b) => out.write(b),
-    );
-    await out.close();
+    try {
+      await readAll(
+        reader,
+        (n) => onProgress?.(n, reader.size),
+        signal,
+        (b) => out.write(b),
+      );
+      await out.close();
+    } catch (e) {
+      // Leave nothing half-written behind.
+      await out.abort().catch(() => {});
+      if (saved) await folder?.removeEntry(saved).catch(() => {});
+      throw e;
+    }
     return true;
   }
-  const blob = new Blob(await readAll(reader, (n) => onProgress?.(n, reader.size)), {
+  const blob = new Blob(await readAll(reader, (n) => onProgress?.(n, reader.size), signal), {
     type: item.mimeType ?? guessMime(item.name),
   });
   const url = URL.createObjectURL(blob);
