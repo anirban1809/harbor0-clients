@@ -10,6 +10,8 @@ export type FileDownloadStatus = {
   total: number;
   loaded: number;
   size: number | null;
+  /** Still finding the files in folder `name`; `total` is how many so far. */
+  listing?: boolean;
 };
 
 export function FileDownloadStatusPanel({
@@ -19,12 +21,23 @@ export function FileDownloadStatusPanel({
   progress: FileDownloadStatus;
   onCancel: () => void;
 }) {
-  const { name, done, total, loaded, size } = progress;
+  const { name, done, total, loaded, size, listing } = progress;
   const percent =
-    size === null ? null : size === 0 ? 100 : Math.min(100, Math.floor((loaded / size) * 100));
-  const heading = total === 1 ? `Downloading ${name}` : `Downloading ${done + 1} of ${total} files`;
-  const message =
-    percent === null ? 'Connecting to storage…' : `${fileSize(loaded)} of ${fileSize(size!)}`;
+    listing || size === null
+      ? null
+      : size === 0
+        ? 100
+        : Math.min(100, Math.floor((loaded / size) * 100));
+  const heading = listing
+    ? `Finding files in ${name}…`
+    : total === 1
+      ? `Downloading ${name}`
+      : `Downloading ${done + 1} of ${total} files`;
+  const message = listing
+    ? `${total} ${total === 1 ? 'file' : 'files'} found`
+    : percent === null
+      ? 'Connecting to storage…'
+      : `${fileSize(loaded)} of ${fileSize(size!)}`;
   return (
     <section
       className="card status-card zip-download-status"
@@ -40,13 +53,13 @@ export function FileDownloadStatusPanel({
       </div>
       <div className="status-card-details">
         <span>{message}</span>
-        {total > 1 && (
+        {total > 1 && !listing && (
           <span>
             {done} {done === 1 ? 'file' : 'files'} completed
           </span>
         )}
       </div>
-      {total > 1 && (
+      {total > 1 && !listing && (
         <p className="status-card-file" title={name}>
           {name}
         </p>

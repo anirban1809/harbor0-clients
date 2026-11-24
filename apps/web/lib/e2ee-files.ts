@@ -216,8 +216,16 @@ type FileHandle = { createWritable: () => Promise<Writable> };
 type SavePicker = (options: { suggestedName: string }) => Promise<FileHandle>;
 /** A folder the browser lets the page write into (showDirectoryPicker). */
 export type SaveFolder = {
+  name: string;
   getFileHandle: (name: string, options?: { create?: boolean }) => Promise<FileHandle>;
+  getDirectoryHandle: (name: string, options?: { create?: boolean }) => Promise<SaveFolder>;
   removeEntry: (name: string) => Promise<void>;
+};
+
+/** A drive name the browser accepts on disk: no slashes, and never "." or "..". */
+const diskName = (name: string) => {
+  const safe = name.replace(/[\\/]/g, '_');
+  return safe === '.' || safe === '..' ? '_' : safe;
 };
 
 /**
@@ -240,20 +248,87 @@ export async function pickSaveFolder(): Promise<SaveFolder | null | undefined> {
   }
 }
 
-/** A file in `folder` named like `name` that isn't there yet: "a.pdf", then "a (1).pdf". */
+/** Names like `name` that aren't taken yet: "a.pdf", then "a (1).pdf", "a (2).pdf"… */
+function* candidates(name: string, ext = true) {
+  name = diskName(name);
+  const dot = ext ? name.lastIndexOf('.') : -1;
+  const [stem, end] = dot > 0 ? [name.slice(0, dot), name.slice(dot)] : [name, ''];
+  for (let n = 0; ; n++) yield n ? `${stem} (${n})${end}` : name;
+}
+
+/** Nothing has the name. */
+const free = (e: unknown) => (e as Error).name === 'NotFoundError';
+/** Something of the other kind (a file, not a folder, or the reverse) has the name. */
+const otherKind = (e: unknown) => (e as Error).name === 'TypeMismatchError';
+
+/** A file in `folder` named like `name` that isn't there yet. */
 async function freshFile(folder: SaveFolder, name: string) {
-  const dot = name.lastIndexOf('.');
-  const [stem, ext] = dot > 0 ? [name.slice(0, dot), name.slice(dot)] : [name, ''];
-  for (let n = 0; ; n++) {
-    const candidate = n ? `${stem} (${n})${ext}` : name;
+  for (const candidate of candidates(name)) {
     try {
       await folder.getFileHandle(candidate);
     } catch (e) {
-      if ((e as Error).name === 'NotFoundError')
+      if (free(e))
         return { name: candidate, handle: await folder.getFileHandle(candidate, { create: true }) };
       // A folder by that name: try the next one.
-      if ((e as Error).name !== 'TypeMismatchError') throw e;
+      if (!otherKind(e)) throw e;
     }
+  }
+  throw new Error('unreachable');
+}
+
+/** A new folder in `parent` named like `name`, beside anything already there. */
+export async function freshFolder(parent: SaveFolder, name: string) {
+  for (const candidate of candidates(name, false)) {
+    try {
+      await parent.getDirectoryHandle(candidate);
+    } catch (e) {
+      if (free(e)) return parent.getDirectoryHandle(candidate, { create: true });
+      if (!otherKind(e)) throw e;
+    }
+  }
+  throw new Error('unreachable');
+}
+
+/** The folder at `path` under `root`, made as needed. */
+export async function folderAt(root: SaveFolder, path: string[]) {
+  let folder = root;
+  for (const name of path)
+    folder = await folder.getDirectoryHandle(diskName(name), { create: true });
+  return folder;
+}
+
+/** Streams `item` into `folder` as stored, unencrypted: a file the account stored before encrypting. */
+export async function savePlain(
+  api: ApiClient,
+  item: Pick<DriveItem, 'id' | 'name'>,
+  folder: SaveFolder,
+  signal?: AbortSignal,
+  onProgress?: (loaded: number, total: number) => void,
+) {
+  const link = await api.download({ driveItemId: item.id });
+  const response = await fetch(link.downloadUrl, {
+    signal,
+    credentials: 'omit',
+    referrerPolicy: 'no-referrer',
+  });
+  if (!response.ok || !response.body)
+    throw new Error(`The download failed (${response.status}). Try again.`);
+  const { name, handle } = await freshFile(folder, item.name);
+  const out = await handle.createWritable();
+  try {
+    let loaded = 0;
+    for (const reader = response.body.getReader(); ;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      await out.write(value);
+      loaded += value.length;
+      onProgress?.(loaded, link.sizeBytes);
+    }
+    await out.close();
+  } catch (e) {
+    await out.abort().catch(() => {});
+    await folder.removeEntry(name).catch(() => {});
+    throw e;
   }
 }
 

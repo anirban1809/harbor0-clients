@@ -104,6 +104,8 @@ type Props = {
   syncedFolderIds?: string[];
   localSyncDevices?: Record<string, { id: string; name: string }[]>;
   canOpenDeviceCopy?: boolean;
+  /** Folders download as a ZIP; false when they're saved file by file instead (encryption). */
+  zipFolders?: boolean;
   onOpen: (item: DriveItem) => void;
   onUpload: () => void;
   onDropFiles: (entries: UploadEntry[]) => Promise<unknown>;
@@ -180,6 +182,7 @@ export function DriveWorkspace({
   preloadPdf = false,
   onOpen,
   canOpenDeviceCopy = false,
+  zipFolders = true,
   onUpload,
   onDropFiles,
   onUploadFolder,
@@ -1129,7 +1132,7 @@ export function DriveWorkspace({
         <MenuSeparator />
         {(!item.backupRootId || !canOpenDeviceCopy) && (
           <MenuItem disabled={busy} onClick={() => void download([item])}>
-            {item.type === 'FOLDER' ? 'Download as ZIP' : 'Download'}
+            {item.type === 'FOLDER' && zipFolders ? 'Download as ZIP' : 'Download'}
           </MenuItem>
         )}
         {canShare(item) && (

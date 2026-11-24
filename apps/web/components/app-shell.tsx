@@ -144,11 +144,15 @@ import { e2eeTransport } from '../lib/e2ee-transport';
 import { currentVault, lock, restore as restoreVault, useVault } from '../lib/e2ee-vault';
 import {
   encryptedPreview,
+  folderAt,
+  freshFolder,
   isEncrypted,
   pickSaveFolder,
   saveEncrypted,
+  savePlain,
   type SaveFolder,
 } from '../lib/e2ee-files';
+import { listFolderFiles, type FolderFile } from '../lib/folder-files';
 import { LINK_SYNC_MS, syncAllLinks } from '../lib/e2ee-links';
 import { INBOX_SYNC_MS, syncRequestInbox } from '../lib/e2ee-requests';
 import { startDecryption, startMigration, useMigrationProgress } from '../lib/e2ee-migration';
@@ -847,36 +851,73 @@ function Workspace() {
       a.remove();
     });
   }
+  const decrypts = (item: DriveItem) => currentVault().enabled && isEncrypted(item);
   /**
    * Downloads files one after another with progress. Several encrypted files are saved into one
    * folder the person picks, where the browser can, instead of a download each.
    */
   async function downloadFiles(items: DriveItem[]) {
     if (fileJob.current) return;
-    const decrypt = (item: DriveItem) => currentVault().enabled && isEncrypted(item);
     let folder: SaveFolder | undefined;
-    if (items.filter(decrypt).length > 1) {
+    if (items.filter(decrypts).length > 1) {
       // Asked first, while the click still lets the browser show a picker.
       const picked = await pickSaveFolder();
       if (picked === undefined) return;
       folder = picked ?? undefined;
     }
+    await saveFiles(async () => ({ files: items.map((item) => ({ item, path: [] })), folder }));
+  }
+  /**
+   * A folder on an encrypted account, which the server can't zip: its files are decrypted here
+   * and saved into a new folder inside the one the person picks, keeping the folders within it.
+   * Where the browser has no folder picker, each file downloads on its own.
+   */
+  async function downloadEncryptedFolder(root: DriveItem) {
+    if (fileJob.current) return;
+    const picked = await pickSaveFolder();
+    if (picked === undefined) return;
+    await saveFiles(async (signal) => {
+      setFileProgress({ name: root.name, done: 0, total: 0, loaded: 0, size: null, listing: true });
+      const { files, folders, deviceOnly } = await listFolderFiles(api, root.id, signal, (found) =>
+        setFileProgress((old) => old && { ...old, total: found }),
+      );
+      if (!picked) return { files, deviceOnly, root: root.name };
+      const folder = await freshFolder(picked, root.name);
+      for (const path of folders) await folderAt(folder, path);
+      return { files, folder, deviceOnly, root: folder.name };
+    });
+  }
+  async function saveFiles(
+    plan: (signal: AbortSignal) => Promise<{
+      files: FolderFile[];
+      folder?: SaveFolder;
+      /** Files stored only on linked devices, left out. */
+      deviceOnly?: number;
+      /** The folder being downloaded, by the name it's saved under. */
+      root?: string;
+    }>,
+  ) {
     const controller = new AbortController();
     fileJob.current = controller;
     setError('');
     let done = 0;
     try {
-      for (const item of items) {
+      const { files, folder, deviceOnly = 0, root } = await plan(controller.signal);
+      for (const { item, path } of files) {
         controller.signal.throwIfAborted();
-        setFileProgress({ name: item.name, done, total: items.length, loaded: 0, size: null });
-        if (decrypt(item)) {
+        setFileProgress({ name: item.name, done, total: files.length, loaded: 0, size: null });
+        const onProgress = (loaded: number, size: number) =>
+          setFileProgress((old) => old && { ...old, loaded, size });
+        const into = folder && (await folderAt(folder, path));
+        if (decrypts(item)) {
           const saved = await saveEncrypted(api, item, {
-            folder,
+            folder: into,
             signal: controller.signal,
-            onProgress: (loaded, size) => setFileProgress((old) => old && { ...old, loaded, size }),
+            onProgress,
           });
           if (!saved) break;
-        } else {
+        } else if (into) await savePlain(api, item, into, controller.signal, onProgress);
+        else {
           const r = await api.download({ driveItemId: item.id });
           const a = document.createElement('a');
           a.href = r.downloadUrl;
@@ -888,7 +929,14 @@ function Workspace() {
         }
         done++;
       }
-      if (folder && done) setToast(`Saved ${done} ${done === 1 ? 'file' : 'files'}.`);
+      const count = (n: number) => `${n} ${n === 1 ? 'file' : 'files'}`;
+      const skipped = deviceOnly
+        ? ` ${count(deviceOnly)} stored only on your devices ${deviceOnly === 1 ? 'was' : 'were'} left out.`
+        : '';
+      if (root && !files.length && !deviceOnly) setToast(`${root} is empty.`);
+      else if (folder && done)
+        setToast(`Saved ${count(done)}${root ? ` to ${root}` : ''}.${skipped}`);
+      else if (skipped) setToast(skipped.trim());
     } catch (e) {
       if (!controller.signal.aborted) setError((e as Error).message);
       else if (done) setToast(`Download cancelled after ${done} ${done === 1 ? 'file' : 'files'}.`);
@@ -898,6 +946,7 @@ function Workspace() {
     }
   }
   async function downloadFolder(item: DriveItem) {
+    if (currentVault().enabled) return downloadEncryptedFolder(item);
     if (zipJob.current) return;
     const controller = new AbortController();
     zipJob.current = controller;
@@ -1628,6 +1677,7 @@ function Workspace() {
                     await download({ driveItemId: item.id, ...(versionId ? { versionId } : {}) });
                 }}
                 onDownloadFiles={downloadFiles}
+                zipFolders={!vault.enabled}
                 onChanged={() => void refresh(false)}
                 onManageStorage={() => navigate('Storage')}
               />
@@ -1765,14 +1815,16 @@ function Workspace() {
                             </MenuItem>
                           )}
                           <MenuItem
-                            disabled={busy || !!zipProgress}
+                            disabled={busy || !!zipProgress || !!fileProgress}
                             onClick={() =>
                               void (item.type === 'FOLDER'
                                 ? downloadFolder(item)
                                 : download({ driveItemId: item.id }))
                             }
                           >
-                            {item.type === 'FOLDER' ? 'Download as ZIP' : 'Download'}
+                            {item.type === 'FOLDER' && !vault.enabled
+                              ? 'Download as ZIP'
+                              : 'Download'}
                           </MenuItem>
                           {itemAccess(item).share && (
                             <>
