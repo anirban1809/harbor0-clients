@@ -379,18 +379,21 @@ export async function saveEncrypted(
     }
     return true;
   }
-  const blob = new Blob(await readAll(reader, (n) => onProgress?.(n, reader.size), signal), {
-    type: item.mimeType ?? guessMime(item.name),
-  });
-  const url = URL.createObjectURL(blob);
+  saveBlob(await readAll(reader, (n) => onProgress?.(n, reader.size), signal), item.name);
+  return true;
+}
+
+/** Saves bytes made in the page as an ordinary download named `name`. */
+export function saveBlob(parts: BlobPart[], name: string) {
+  // A plain binary type, so iOS Safari saves it instead of opening it in place of the app.
+  const url = URL.createObjectURL(new Blob(parts, { type: 'application/octet-stream' }));
   const a = document.createElement('a');
   a.href = url;
-  a.download = item.name;
+  a.download = name;
   document.body.append(a);
   a.click();
   a.remove();
   setTimeout(() => URL.revokeObjectURL(url), 60_000);
-  return true;
 }
 
 export type EncryptedUploadInput = {

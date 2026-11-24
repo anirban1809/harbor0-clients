@@ -995,7 +995,10 @@ export function DriveWorkspace({
         throw new Error(
           'This file is stored on linked devices. Open its local copy in the desktop app.',
         );
-      const files = onDownloadFiles ? targets.filter((item) => item.type === 'FILE') : [];
+      // Folders the server zips download on their own; others go along with the files.
+      const files = onDownloadFiles
+        ? targets.filter((item) => item.type === 'FILE' || !zipFolders)
+        : [];
       if (files.length) await onDownloadFiles!(files);
       for (const item of targets) if (!files.includes(item)) await onDownload(item);
     }, false);

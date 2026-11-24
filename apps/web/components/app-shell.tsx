@@ -148,11 +148,14 @@ import {
   freshFolder,
   isEncrypted,
   pickSaveFolder,
+  saveBlob,
   saveEncrypted,
   savePlain,
   type SaveFolder,
 } from '../lib/e2ee-files';
 import { listFolderFiles, type FolderFile } from '../lib/folder-files';
+import { fileSize } from '../lib/file-metadata';
+import { zipFolder } from '../lib/zip-folder';
 import { LINK_SYNC_MS, syncAllLinks } from '../lib/e2ee-links';
 import { INBOX_SYNC_MS, syncRequestInbox } from '../lib/e2ee-requests';
 import { startDecryption, startMigration, useMigrationProgress } from '../lib/e2ee-migration';
@@ -851,46 +854,64 @@ function Workspace() {
       a.remove();
     });
   }
+  /** 5 GB, the most the web app saves as one ZIP, built in memory; more is for the desktop app. */
+  const ZIP_LIMIT = 5 * 1000 ** 3;
   const decrypts = (item: DriveItem) => currentVault().enabled && isEncrypted(item);
   /**
-   * Downloads files one after another with progress. Several encrypted files are saved into one
-   * folder the person picks, where the browser can, instead of a download each.
+   * Downloads files, and on an encrypted account folders too, one file after another with
+   * progress. The server can't zip an encrypted folder, so its files are decrypted here, keeping
+   * the folders within it. Several files or any folder are saved as one ZIP built here, or on
+   * Android into a folder the person picks: one download each would mean a prompt for every file,
+   * and iPhone stops the page's other requests when one starts.
    */
   async function downloadFiles(items: DriveItem[]) {
     if (fileJob.current) return;
+    const folders = items.filter((item) => item.type === 'FOLDER');
+    // A folder on its own is saved under its own name, not inside "harbor0 files".
+    const only = items.length === 1 ? folders[0] : undefined;
     let folder: SaveFolder | undefined;
-    if (items.filter(decrypts).length > 1) {
+    let zip: ReturnType<typeof zipFolder> | undefined;
+    if (folders.length || items.filter(decrypts).length > 1) {
       // Asked first, while the click still lets the browser show a picker.
-      const picked = await pickSaveFolder();
+      const picked = /Android/i.test(navigator.userAgent) ? await pickSaveFolder() : null;
       if (picked === undefined) return;
-      folder = picked ?? undefined;
+      if (picked) folder = picked;
+      else folder = (zip = zipFolder(only?.name ?? 'harbor0 files')).root;
     }
-    await saveFiles(async () => ({ files: items.map((item) => ({ item, path: [] })), folder }));
-  }
-  /**
-   * A folder on an encrypted account, which the server can't zip: its files are decrypted here
-   * and saved into a new folder inside the one the person picks, keeping the folders within it.
-   * Where the browser has no folder picker, each file downloads on its own.
-   */
-  async function downloadEncryptedFolder(root: DriveItem) {
-    if (fileJob.current) return;
-    const picked = await pickSaveFolder();
-    if (picked === undefined) return;
     await saveFiles(async (signal) => {
-      setFileProgress({ name: root.name, done: 0, total: 0, loaded: 0, size: null, listing: true });
-      const { files, folders, deviceOnly } = await listFolderFiles(api, root.id, signal, (found) =>
-        setFileProgress((old) => old && { ...old, total: found }),
-      );
-      if (!picked) return { files, deviceOnly, root: root.name };
-      const folder = await freshFolder(picked, root.name);
-      for (const path of folders) await folderAt(folder, path);
-      return { files, folder, deviceOnly, root: folder.name };
+      const files: FolderFile[] = items
+        .filter((item) => item.type !== 'FOLDER')
+        .map((item) => ({ item, path: [] }));
+      let deviceOnly = 0;
+      let root: string | undefined;
+      for (const top of folders) {
+        setFileProgress({
+          name: top.name,
+          done: 0,
+          total: 0,
+          loaded: 0,
+          size: null,
+          listing: true,
+        });
+        const listed = await listFolderFiles(api, top.id, signal, (found) =>
+          setFileProgress((old) => old && { ...old, total: files.length + found }),
+        );
+        const into = only && zip ? zip.root : await freshFolder(folder!, top.name);
+        for (const path of listed.folders) await folderAt(into, path);
+        const under = into === folder ? [] : [into.name];
+        files.push(...listed.files.map((file) => ({ ...file, path: [...under, ...file.path] })));
+        deviceOnly += listed.deviceOnly;
+        if (only) root = into.name;
+      }
+      return { files, folder, zip, deviceOnly, root };
     });
   }
   async function saveFiles(
     plan: (signal: AbortSignal) => Promise<{
       files: FolderFile[];
       folder?: SaveFolder;
+      /** When `folder` is a ZIP built in memory, saved once every file is in. */
+      zip?: ReturnType<typeof zipFolder>;
       /** Files stored only on linked devices, left out. */
       deviceOnly?: number;
       /** The folder being downloaded, by the name it's saved under. */
@@ -902,7 +923,12 @@ function Workspace() {
     setError('');
     let done = 0;
     try {
-      const { files, folder, deviceOnly = 0, root } = await plan(controller.signal);
+      const { files, folder, zip, deviceOnly = 0, root } = await plan(controller.signal);
+      const bytes = files.reduce((n, { item }) => n + item.sizeBytes, 0);
+      if (zip && bytes > ZIP_LIMIT)
+        throw new Error(
+          `This download is ${fileSize(bytes)}. The web app downloads up to 5 GB at once. Use the harbor0 desktop app for larger downloads, or select fewer files.`,
+        );
       for (const { item, path } of files) {
         controller.signal.throwIfAborted();
         setFileProgress({ name: item.name, done, total: files.length, loaded: 0, size: null });
@@ -934,7 +960,10 @@ function Workspace() {
         ? ` ${count(deviceOnly)} stored only on your devices ${deviceOnly === 1 ? 'was' : 'were'} left out.`
         : '';
       if (root && !files.length && !deviceOnly) setToast(`${root} is empty.`);
-      else if (folder && done)
+      else if (zip && done) {
+        saveBlob(zip.finish(), `${zip.root.name}.zip`);
+        setToast(`Saved ${count(done)} to ${zip.root.name}.zip.${skipped}`);
+      } else if (folder && done)
         setToast(`Saved ${count(done)}${root ? ` to ${root}` : ''}.${skipped}`);
       else if (skipped) setToast(skipped.trim());
     } catch (e) {
@@ -946,7 +975,7 @@ function Workspace() {
     }
   }
   async function downloadFolder(item: DriveItem) {
-    if (currentVault().enabled) return downloadEncryptedFolder(item);
+    if (currentVault().enabled) return downloadFiles([item]);
     if (zipJob.current) return;
     const controller = new AbortController();
     zipJob.current = controller;
