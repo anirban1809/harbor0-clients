@@ -33,8 +33,6 @@ import {
 } from './device-folders';
 import { loadFolderTrail } from '../lib/folder-navigation';
 import { useDebouncedValue } from '../lib/use-debounced-value';
-import { downloadFolderZip } from '../lib/folder-download';
-import { ZipDownloadStatusPanel, type ZipDownloadStatus } from './zip-download-status';
 import { FileDownloadStatusPanel, type FileDownloadStatus } from './file-download-status';
 import { ZipFolder } from './zip-folder';
 import { isZip } from '../lib/zip-drive';
@@ -148,14 +146,13 @@ import {
   freshFolder,
   isEncrypted,
   pickSaveFolder,
-  saveBlob,
   saveEncrypted,
   savePlain,
   type SaveFolder,
 } from '../lib/e2ee-files';
 import { listFolderFiles, type FolderFile } from '../lib/folder-files';
 import { fileSize } from '../lib/file-metadata';
-import { zipFolder } from '../lib/zip-folder';
+import { startZip, type ZipDownload } from '../lib/zip-folder';
 import { LINK_SYNC_MS, syncAllLinks } from '../lib/e2ee-links';
 import { INBOX_SYNC_MS, syncRequestInbox } from '../lib/e2ee-requests';
 import { startDecryption, startMigration, useMigrationProgress } from '../lib/e2ee-migration';
@@ -349,9 +346,6 @@ function Workspace() {
   const [error, setError] = useState('');
   const [toast, setToast] = useState('');
   const [busy, setBusy] = useState(false);
-  const [zipProgress, setZipProgress] = useState<ZipDownloadStatus | null>(null);
-  const zipJob = useRef<AbortController | null>(null);
-  useEffect(() => () => zipJob.current?.abort(), []);
   const [fileProgress, setFileProgress] = useState<FileDownloadStatus | null>(null);
   const fileJob = useRef<AbortController | null>(null);
   useEffect(() => () => fileJob.current?.abort(), []);
@@ -854,15 +848,13 @@ function Workspace() {
       a.remove();
     });
   }
-  /** 5 GB, the most the web app saves as one ZIP, built in memory; more is for the desktop app. */
-  const ZIP_LIMIT = 5 * 1000 ** 3;
   const decrypts = (item: DriveItem) => currentVault().enabled && isEncrypted(item);
   /**
-   * Downloads files, and on an encrypted account folders too, one file after another with
-   * progress. The server can't zip an encrypted folder, so its files are decrypted here, keeping
-   * the folders within it. Several files or any folder are saved as one ZIP built here, or on
-   * Android into a folder the person picks: one download each would mean a prompt for every file,
-   * and iPhone stops the page's other requests when one starts.
+   * Downloads files and folders one file after another with progress, decrypting encrypted ones
+   * here and keeping the folders within a folder. Several files or any folder are saved as one ZIP
+   * built here, or on Android into a folder the person picks: one download each would mean a
+   * prompt for every file, and iPhone stops the page's other requests when one starts. A ZIP
+   * larger than the browser can build is left to the desktop app.
    */
   async function downloadFiles(items: DriveItem[]) {
     if (fileJob.current) return;
@@ -870,13 +862,17 @@ function Workspace() {
     // A folder on its own is saved under its own name, not inside "harbor0 files".
     const only = items.length === 1 ? folders[0] : undefined;
     let folder: SaveFolder | undefined;
-    let zip: ReturnType<typeof zipFolder> | undefined;
-    if (folders.length || items.filter(decrypts).length > 1) {
-      // Asked first, while the click still lets the browser show a picker.
+    let zip: ZipDownload | undefined;
+    if (folders.length || items.length > 1) {
+      // Asked first, while the click still lets the browser show a picker or save dialog.
       const picked = /Android/i.test(navigator.userAgent) ? await pickSaveFolder() : null;
       if (picked === undefined) return;
       if (picked) folder = picked;
-      else folder = (zip = zipFolder(only?.name ?? 'harbor0 files')).root;
+      else {
+        zip = await startZip(only?.name ?? 'harbor0 files');
+        if (!zip) return;
+        folder = zip.root;
+      }
     }
     await saveFiles(async (signal) => {
       const files: FolderFile[] = items
@@ -910,8 +906,8 @@ function Workspace() {
     plan: (signal: AbortSignal) => Promise<{
       files: FolderFile[];
       folder?: SaveFolder;
-      /** When `folder` is a ZIP built in memory, saved once every file is in. */
-      zip?: ReturnType<typeof zipFolder>;
+      /** When `folder` is a ZIP, saved once every file is in. */
+      zip?: ZipDownload;
       /** Files stored only on linked devices, left out. */
       deviceOnly?: number;
       /** The folder being downloaded, by the name it's saved under. */
@@ -922,12 +918,16 @@ function Workspace() {
     fileJob.current = controller;
     setError('');
     let done = 0;
+    let zip: ZipDownload | undefined;
+    let zipSaved = false;
     try {
-      const { files, folder, zip, deviceOnly = 0, root } = await plan(controller.signal);
+      const planned = await plan(controller.signal);
+      const { files, folder, deviceOnly = 0, root } = planned;
+      zip = planned.zip;
       const bytes = files.reduce((n, { item }) => n + item.sizeBytes, 0);
-      if (zip && bytes > ZIP_LIMIT)
+      if (zip && bytes > zip.limit)
         throw new Error(
-          `This download is ${fileSize(bytes)}. The web app downloads up to 5 GB at once. Use the harbor0 desktop app for larger downloads, or select fewer files.`,
+          `This download is ${fileSize(bytes)}. This browser can download up to ${zip.limit / 1000 ** 3} GB at once from the web app. Use the harbor0 desktop app for larger downloads, or select fewer files.`,
         );
       for (const { item, path } of files) {
         controller.signal.throwIfAborted();
@@ -961,7 +961,8 @@ function Workspace() {
         : '';
       if (root && !files.length && !deviceOnly) setToast(`${root} is empty.`);
       else if (zip && done) {
-        saveBlob(zip.finish(), `${zip.root.name}.zip`);
+        await zip.save();
+        zipSaved = true;
         setToast(`Saved ${count(done)} to ${zip.root.name}.zip.${skipped}`);
       } else if (folder && done)
         setToast(`Saved ${count(done)}${root ? ` to ${root}` : ''}.${skipped}`);
@@ -970,35 +971,9 @@ function Workspace() {
       if (!controller.signal.aborted) setError((e as Error).message);
       else if (done) setToast(`Download cancelled after ${done} ${done === 1 ? 'file' : 'files'}.`);
     } finally {
+      if (zip && !zipSaved) await zip.discard();
       fileJob.current = null;
       setFileProgress(null);
-    }
-  }
-  async function downloadFolder(item: DriveItem) {
-    if (currentVault().enabled) return downloadFiles([item]);
-    if (zipJob.current) return;
-    const controller = new AbortController();
-    zipJob.current = controller;
-    setError('');
-    setZipProgress({
-      name: item.name,
-      phase: 'queued',
-      files: 0,
-      bytes: 0,
-      currentFile: null,
-      fileBytes: 0,
-      fileSize: null,
-    });
-    try {
-      const saved = await downloadFolderZip(api, item, controller.signal, (progress) =>
-        setZipProgress({ name: item.name, ...progress }),
-      );
-      if (saved) setToast(`${item.name}.zip download started. Check your browser’s downloads.`);
-    } catch (error) {
-      if (!controller.signal.aborted) setError((error as Error).message);
-    } finally {
-      zipJob.current = null;
-      setZipProgress(null);
     }
   }
   function setUpload(key: string, change: Partial<FileUpload>) {
@@ -1583,12 +1558,6 @@ function Workspace() {
               onCancel={() => fileJob.current?.abort()}
             />
           )}
-          {zipProgress && (
-            <ZipDownloadStatusPanel
-              progress={zipProgress}
-              onCancel={() => zipJob.current?.abort()}
-            />
-          )}
           {!drivePage && !(place && !searching) && !photosHeading && (
             <div
               className={`page-heading ${section === 'Shared' ? 'shared-heading' : ''}`}
@@ -1701,12 +1670,12 @@ function Workspace() {
                 }}
                 onDropFiles={(entries) => uploadEntries(entries)}
                 onDownload={async (item, versionId) => {
-                  if (item.type === 'FOLDER') await downloadFolder(item);
+                  if (item.type === 'FOLDER') await downloadFiles([item]);
                   else
                     await download({ driveItemId: item.id, ...(versionId ? { versionId } : {}) });
                 }}
                 onDownloadFiles={downloadFiles}
-                zipFolders={!vault.enabled}
+                zipFolders={false}
                 onChanged={() => void refresh(false)}
                 onManageStorage={() => navigate('Storage')}
               />
@@ -1844,16 +1813,14 @@ function Workspace() {
                             </MenuItem>
                           )}
                           <MenuItem
-                            disabled={busy || !!zipProgress || !!fileProgress}
+                            disabled={busy || !!fileProgress}
                             onClick={() =>
                               void (item.type === 'FOLDER'
-                                ? downloadFolder(item)
+                                ? downloadFiles([item])
                                 : download({ driveItemId: item.id }))
                             }
                           >
-                            {item.type === 'FOLDER' && !vault.enabled
-                              ? 'Download as ZIP'
-                              : 'Download'}
+                            Download
                           </MenuItem>
                           {itemAccess(item).share && (
                             <>

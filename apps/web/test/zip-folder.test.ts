@@ -23,7 +23,7 @@ it('keeps the folders and files saved into it, with their checksums', async () =
   const taxes = await zip.root.getDirectoryHandle('Taxes 2025', { create: true });
   await save(taxes, 'W-2.pdf', 'wages');
   await zip.root.getDirectoryHandle('Empty', { create: true });
-  const zipSource = await source(zip.finish());
+  const zipSource = await source(await zip.finish());
   const entries = await readZipDirectory(zipSource);
   expect(entries.map((e) => [e.path, e.directory])).toEqual([
     ['Documents', true],
@@ -62,6 +62,31 @@ it('acts like a folder on disk: taken names, case and removed files', async () =
   await out.abort();
   await zip.root.removeEntry('c.pdf');
   await expect(zip.root.getFileHandle('c.pdf')).rejects.toMatchObject({ name: 'NotFoundError' });
-  const entries = await readZipDirectory(await source(zip.finish()));
+  const entries = await readZipDirectory(await source(await zip.finish()));
   expect(entries.map((e) => e.path)).toEqual(['Files', 'Files/a.pdf', 'Files/Sub']);
+});
+
+it('writes the same ZIP to a file as it builds in memory', async () => {
+  const build = async (out?: (bytes: Uint8Array) => Promise<void>) => {
+    const zip = zipFolder('Files', out);
+    await save(zip.root, 'a.pdf', 'one ', 'two');
+    const sub = await zip.root.getDirectoryHandle('Sub', { create: true });
+    await save(sub, 'b.pdf', 'three');
+    return zip.finish();
+  };
+  const written: Uint8Array[] = [];
+  // A slow disk, so writes would land out of order if they weren't queued.
+  await build(async (bytes) => {
+    await new Promise((resolve) => setTimeout(resolve, Math.random() * 5));
+    written.push(bytes.slice());
+  });
+  const memory = new Uint8Array(await new Blob(await build()).arrayBuffer());
+  const disk = new Uint8Array(await new Blob(written as BlobPart[]).arrayBuffer());
+  // Dates match within a run; compare all but the modified times by reading both back.
+  const entries = async (bytes: Uint8Array) =>
+    (await readZipDirectory({ size: bytes.length, read: async (a, b) => bytes.slice(a, b) })).map(
+      (e) => [e.path, e.size, e.offset],
+    );
+  expect(disk.length).toBe(memory.length);
+  expect(await entries(disk)).toEqual(await entries(memory));
 });
