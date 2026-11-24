@@ -67,6 +67,8 @@ export const fileRequestSchema = z.object({
   /** Files and bytes received so far and on the way. */
   usedFiles: z.number(),
   usedBytes: z.number(),
+  /** A room's: guests add anywhere inside the folder. */
+  room: z.boolean().default(false),
   e2ee: fileRequestE2eeSchema.nullable(),
 });
 export type FileRequest = z.infer<typeof fileRequestSchema>;
@@ -86,6 +88,11 @@ export const fileRequestInput = z
     askName: z.boolean().default(true),
     /** A room's request: guests may add files and folders anywhere inside the folder. */
     room: z.boolean().default(false),
+    /**
+     * An encrypted room's link. Guests also wrap each file for it, so the room's page shows the
+     * file before the owner's app adds it to the drive.
+     */
+    linkId: z.string().min(1).max(128).optional(),
     maxFileBytes: limits.maxFileBytes.default(FILE_REQUEST_DEFAULTS.maxFileBytes),
     maxFiles: limits.maxFiles.default(FILE_REQUEST_DEFAULTS.maxFiles),
     maxTotalBytes: limits.maxTotalBytes.default(FILE_REQUEST_DEFAULTS.maxTotalBytes),
@@ -171,8 +178,10 @@ export const fileRequestViewSchema = z.object({
   maxFileBytes: z.number(),
   filesLeft: z.number(),
   bytesLeft: z.number(),
-  /** Guests may choose a folder inside the request's, and make new ones. */
+  /** Guests may make folders. */
   folders: z.boolean(),
+  /** A room's: guests may add to any folder inside the request's. */
+  room: z.boolean().default(false),
 });
 export type FileRequestView = z.infer<typeof fileRequestViewSchema>;
 
@@ -202,6 +211,8 @@ export const fileRequestFolderInput = z
   .strict();
 export const fileRequestUploadSchema = z.object({
   id: z.string(),
+  /** The file's id once it's added, which an encrypted room's link wrap is bound to. */
+  itemId: z.string(),
   partSizeBytes: z.number(),
 });
 export const fileRequestPartsInput = z
@@ -217,6 +228,11 @@ export const fileRequestCompleteInput = z
       .min(1)
       .max(10000),
     contentHash: z.string().regex(/^[a-f0-9]{64}$/),
+    /** An encrypted room's: the file's name and key wrapped for the room's link. */
+    linkWrap: z
+      .object({ nameWrap: b64(2000).min(20), keyWrap: b64(200).min(20) })
+      .strict()
+      .optional(),
   })
   .strict();
 

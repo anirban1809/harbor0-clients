@@ -41,7 +41,6 @@ const BLANK: RoomContent = {
   logo: null,
   sendBackUrl: null,
 };
-const SEND_BACK_FOLDER = 'From client';
 
 /** A room's page as saved, opened with the link's keys when it's encrypted. */
 async function readRoom(request: Transport, link: PublicLink, keys: AccountKeys | undefined) {
@@ -53,12 +52,29 @@ async function readRoom(request: Transport, link: PublicLink, keys: AccountKeys 
   return roomContentSchema.parse(JSON.parse(json));
 }
 
-/** Turns off a room's send-back request, found by the token in its link. */
-async function closeSendBack(request: Transport, url: string) {
+/** A room's upload request, found by the token in its link. */
+async function findSendBack(request: Transport, url: string) {
   const token = (url: string) => url.split('#')[1]?.split('.')[0];
   const { items }: { items: FileRequest[] } = await request('/v1/file-requests');
-  const made = items.find((item) => token(item.url) === token(url));
+  return items.find((item) => token(item.url) === token(url));
+}
+
+/** Turns off a room's upload request. */
+async function closeSendBack(request: Transport, url: string) {
+  const made = await findSendBack(request, url);
   if (made) await request(`/v1/file-requests/${made.id}`, { method: 'DELETE' });
+}
+
+/**
+ * The room's upload link if it still covers the whole room. Older rooms took uploads into one
+ * `From client` folder; theirs is turned off, so the room gets one like any folder.
+ */
+async function keptSendBack(request: Transport, url: string | null) {
+  if (!url) return null;
+  const made = await findSendBack(request, url);
+  if (made?.room && !made.disabledAt) return url;
+  if (made) await request(`/v1/file-requests/${made.id}`, { method: 'DELETE' });
+  return null;
 }
 
 /** Makes a folder a branded page for a client, or changes it, and shows who's been there. */
@@ -131,53 +147,27 @@ export function ClientRoomDialog({
   }
 
   /**
-   * The link clients upload through. They add to any folder in the room; guests can't encrypt
-   * folder names, so an encrypted room takes uploads into one subfolder.
+   * The link clients upload through: they add to any folder in the room. In an encrypted room
+   * they also wrap each file for the room's link, so the room shows it straight away.
    */
-  async function sendBackRequest() {
+  async function sendBackRequest(target: PublicLink) {
+    const common = {
+      driveItemId: folder.id,
+      expiresInDays: expiry === 'never' ? null : Number(expiry),
+      room: true,
+      ...FILE_REQUEST_DEFAULTS,
+    };
     if (!host.encrypted) {
       const { request: made } = await request('/v1/file-requests', {
         method: 'POST',
-        body: {
-          driveItemId: folder.id,
-          title: content.name,
-          expiresInDays: expiry === 'never' ? null : Number(expiry),
-          askName: false,
-          room: true,
-          ...FILE_REQUEST_DEFAULTS,
-        },
+        body: { ...common, title: content.name, askName: false },
       });
       return requestUrl(made, keys);
     }
-    const { items: siblings } = await request(
-      `/v1/drive/folders/${encodeURIComponent(folder.id)}/children`,
-    );
-    const existing = siblings.find(
-      (i: { type: string; name: string }) => i.type === 'FOLDER' && i.name === SEND_BACK_FOLDER,
-    );
-    const target =
-      existing ??
-      (
-        await request('/v1/drive/folders', {
-          method: 'POST',
-          body: {
-            operationId: crypto.randomUUID(),
-            parentId: folder.id,
-            name: SEND_BACK_FOLDER,
-          },
-        })
-      ).item;
-    const details = { title: content.name, message: '' };
-    const sealed = await newEncryptedRequest(keys!, details);
+    const sealed = await newEncryptedRequest(keys!, { title: content.name, message: '' });
     const { request: made } = await request('/v1/file-requests', {
       method: 'POST',
-      body: {
-        driveItemId: target.id,
-        e2ee: sealed.e2ee,
-        expiresInDays: expiry === 'never' ? null : Number(expiry),
-        askName: true,
-        ...FILE_REQUEST_DEFAULTS,
-      },
+      body: { ...common, linkId: target.id, e2ee: sealed.e2ee, askName: false },
     });
     return requestUrl(made, keys);
   }
@@ -190,7 +180,7 @@ export function ClientRoomDialog({
       const target = await ensureLink();
       const sendBackUrl = !sendBack
         ? null
-        : (content.sendBackUrl ?? (await sendBackRequest()));
+        : ((await keptSendBack(request, content.sendBackUrl)) ?? (await sendBackRequest(target)));
       if (!sendBack && content.sendBackUrl) await closeSendBack(request, content.sendBackUrl);
       const room = roomContentSchema.parse({ ...content, sendBackUrl });
       const json = JSON.stringify(room);
@@ -269,7 +259,7 @@ export function ClientRoomDialog({
             label="Let people upload files"
             hint={
               host.encrypted
-                ? `Uploads go to a “${SEND_BACK_FOLDER}” folder in this data room.`
+                ? 'They can add files to any folder in it. Everyone with the link can see them.'
                 : 'They can add files and folders. Everyone with the link can see them.'
             }
           >

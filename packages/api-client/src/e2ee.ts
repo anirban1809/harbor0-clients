@@ -616,6 +616,8 @@ export async function sealRequestFile(publicKey: string, meta: RequestFileMeta) 
   );
   return {
     cipher,
+    /** For a room's link only: wraps this file's key so the link opens it too. */
+    wrapForLink: (link: LinkKeys) => sealed(link.files, content, linkFileAad(bound)),
     sealed: {
       head: b64url(bound),
       sealedKey: b64url(concat(ephemeral, fromB64url(key))),

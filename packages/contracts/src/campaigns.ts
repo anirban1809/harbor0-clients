@@ -11,6 +11,10 @@ import { id } from './index';
 /** Product updates can be unsubscribed from; service notices (terms, pricing) cannot. */
 export const campaignCategory = z.enum(['PRODUCT', 'SERVICE']);
 export type CampaignCategory = z.infer<typeof campaignCategory>;
+/** How wide the email is on a large screen, in pixels; it shrinks to fit a phone. */
+export const campaignWidth = z.enum(['NARROW', 'MEDIUM', 'WIDE']);
+export type CampaignWidth = z.infer<typeof campaignWidth>;
+export const CAMPAIGN_WIDTHS: Record<CampaignWidth, number> = { NARROW: 480, MEDIUM: 560, WIDE: 640 };
 
 /** Placeholders a template may use, filled in for each recipient. */
 export const campaignVariables = {
@@ -43,6 +47,8 @@ export const campaignContentSchema = z.object({
   preheader: z.string().trim().max(200).default(''),
   markdown: z.string().trim().min(1).max(50_000),
   category: campaignCategory,
+  /** Templates and campaigns saved before widths existed have none: they are NARROW. */
+  width: campaignWidth.default('NARROW'),
 });
 export type CampaignContent = z.infer<typeof campaignContentSchema>;
 

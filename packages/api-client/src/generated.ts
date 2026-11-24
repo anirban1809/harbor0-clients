@@ -28008,6 +28008,8 @@ export interface operations {
                             maxTotalBytes: number;
                             usedFiles: number;
                             usedBytes: number;
+                            /** @default false */
+                            room: boolean;
                             e2ee: {
                                 secretWrap: string;
                                 privateKeyWrap: string;
@@ -28186,6 +28188,7 @@ export interface operations {
                     askName?: boolean;
                     /** @default false */
                     room?: boolean;
+                    linkId?: string;
                     /** @default 10000000000 */
                     maxFileBytes?: number;
                     /** @default 200 */
@@ -28225,6 +28228,8 @@ export interface operations {
                             maxTotalBytes: number;
                             usedFiles: number;
                             usedBytes: number;
+                            /** @default false */
+                            room: boolean;
                             e2ee: {
                                 secretWrap: string;
                                 privateKeyWrap: string;
@@ -29293,6 +29298,8 @@ export interface operations {
                             maxTotalBytes: number;
                             usedFiles: number;
                             usedBytes: number;
+                            /** @default false */
+                            room: boolean;
                             e2ee: {
                                 secretWrap: string;
                                 privateKeyWrap: string;
@@ -30949,6 +30956,8 @@ export interface operations {
                         filesLeft: number;
                         bytesLeft: number;
                         folders: boolean;
+                        /** @default false */
+                        room: boolean;
                     };
                 };
             };
@@ -31309,6 +31318,7 @@ export interface operations {
                 content: {
                     "application/json": {
                         id: string;
+                        itemId: string;
                         partSizeBytes: number;
                     };
                 };
@@ -31655,6 +31665,10 @@ export interface operations {
                         etag: string;
                     }[];
                     contentHash: string;
+                    linkWrap?: {
+                        nameWrap: string;
+                        keyWrap: string;
+                    };
                 };
             };
         };

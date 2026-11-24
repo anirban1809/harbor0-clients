@@ -176,6 +176,8 @@ export const adminUserFiltersSchema = z.object({
   desktop: z.enum(['sync', 'backup', 'either', 'neither']).optional(),
   /** Whether end-to-end encryption is on for the account (`on`, including while turning off) or not. */
   e2ee: z.enum(['on', 'off']).optional(),
+  /** Whether the account holds a lifetime seat that is not refunded (`seat`) or not (`none`). */
+  lifetime: z.enum(['seat', 'none']).optional(),
   /**
    * Usage (uploads, downloads, file changes, sync and backups) within N hours (`Nh`) or days
    * (`Nd`), none for more than N days (`inactive-Nd`), or none at all (`none`). Read from the

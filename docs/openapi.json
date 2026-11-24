@@ -62011,6 +62011,10 @@
                           "usedBytes": {
                             "type": "number"
                           },
+                          "room": {
+                            "default": false,
+                            "type": "boolean"
+                          },
                           "e2ee": {
                             "anyOf": [
                               {
@@ -62470,6 +62474,11 @@
                     "default": false,
                     "type": "boolean"
                   },
+                  "linkId": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 128
+                  },
                   "maxFileBytes": {
                     "default": 10000000000,
                     "type": "integer",
@@ -62594,6 +62603,10 @@
                         },
                         "usedBytes": {
                           "type": "number"
+                        },
+                        "room": {
+                          "default": false,
+                          "type": "boolean"
                         },
                         "e2ee": {
                           "anyOf": [
@@ -64710,6 +64723,10 @@
                         },
                         "usedBytes": {
                           "type": "number"
+                        },
+                        "room": {
+                          "default": false,
+                          "type": "boolean"
                         },
                         "e2ee": {
                           "anyOf": [
@@ -69031,6 +69048,10 @@
                     },
                     "folders": {
                       "type": "boolean"
+                    },
+                    "room": {
+                      "default": false,
+                      "type": "boolean"
                     }
                   },
                   "required": [
@@ -69867,12 +69888,16 @@
                     "id": {
                       "type": "string"
                     },
+                    "itemId": {
+                      "type": "string"
+                    },
                     "partSizeBytes": {
                       "type": "number"
                     }
                   },
                   "required": [
                     "id",
+                    "itemId",
                     "partSizeBytes"
                   ]
                 }
@@ -70676,6 +70701,28 @@
                   "contentHash": {
                     "type": "string",
                     "pattern": "^[a-f0-9]{64}$"
+                  },
+                  "linkWrap": {
+                    "type": "object",
+                    "properties": {
+                      "nameWrap": {
+                        "type": "string",
+                        "minLength": 20,
+                        "maxLength": 2000,
+                        "pattern": "^[A-Za-z0-9_-]*$"
+                      },
+                      "keyWrap": {
+                        "type": "string",
+                        "minLength": 20,
+                        "maxLength": 200,
+                        "pattern": "^[A-Za-z0-9_-]*$"
+                      }
+                    },
+                    "required": [
+                      "nameWrap",
+                      "keyWrap"
+                    ],
+                    "additionalProperties": false
                   }
                 },
                 "required": [

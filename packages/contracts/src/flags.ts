@@ -114,6 +114,13 @@ export const featureFlags = {
       CLOSED: 'Closed a support request',
     },
   },
+  'checkout-nudge': {
+    description:
+      'One reminder email an hour after an account’s first checkout, if it hasn’t paid (5 minutes for test accounts). Reminders already scheduled are dropped if the flag goes off.',
+    usage: {
+      NUDGE_SENT: 'Sent the checkout reminder',
+    },
+  },
 } as const satisfies Record<string, FlagDefinition>;
 type FlagDefinition = {
   /** What staff see for it in the console. */
