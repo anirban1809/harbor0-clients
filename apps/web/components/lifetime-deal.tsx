@@ -26,8 +26,8 @@ type LifetimeOffer = {
   prices: { terabytes: number; storageBytes: number; amount: number }[];
   currency: string;
   /**
-   * More TB for the account's seat at one price a TB, up to `maxTerabytes` more (10 TB of add-ons
-   * in all, so 0 once they're used); null without a seat.
+   * More TB for the account's seat at one price a TB, up to `maxTerabytes` more (10 TB of lifetime
+   * storage in all, so 0 once the seat holds that); null without a seat.
    */
   addOn: { amountPerTerabyte: number; maxTerabytes: number } | null;
   owned: LifetimeSeat | null;
