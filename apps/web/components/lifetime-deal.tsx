@@ -25,7 +25,10 @@ type LifetimeOffer = {
   maxTerabytes: number;
   prices: { terabytes: number; storageBytes: number; amount: number }[];
   currency: string;
-  /** More TB for the account's seat, any whole number at one price a TB; null without a seat. */
+  /**
+   * More TB for the account's seat at one price a TB, up to `maxTerabytes` more (10 TB of add-ons
+   * in all, so 0 once they're used); null without a seat.
+   */
   addOn: { amountPerTerabyte: number; maxTerabytes: number } | null;
   owned: LifetimeSeat | null;
   /** The 1–5 TB seats are open to this account (`lifetime-deal`). */
@@ -44,9 +47,9 @@ const ownedSeat = (offer: LifetimeOffer) =>
 const choices = (offer: LifetimeOffer, stacking: boolean): LifetimePrice[] => {
   const owned = ownedSeat(offer);
   if (owned && !stacking) return [];
-  // Any number of TB: the dialog asks how many, starting from 1.
+  // Up to the TB left to add: the dialog asks how many, starting from 1.
   if (owned?.seat)
-    return offer.addOn
+    return offer.addOn && offer.addOn.maxTerabytes >= 1
       ? [{ terabytes: 1, storageBytes: 1e12, amount: offer.addOn.amountPerTerabyte }]
       : [];
   const seats = offer.seatsOpen && !offer.soldOut ? offer.prices : [];
@@ -210,7 +213,7 @@ function LifetimeDialog({
       title={addingOn ? 'Add lifetime storage' : 'Lifetime storage'}
       description={
         addingOn
-          ? `Add as much as you like to your ${lifetimeSize(owned!.terabytes)} lifetime seat, at ${money(offer.addOn!.amountPerTerabyte, offer.currency)} for each TB. One payment, kept for as long as harbor0 runs.`
+          ? `Add up to ${most} TB more to your ${lifetimeSize(owned!.terabytes)} lifetime seat, at ${money(offer.addOn!.amountPerTerabyte, offer.currency)} for each TB. One payment, kept for as long as harbor0 runs.`
           : `One payment, every feature, for as long as harbor0 runs. ${[
               !owned &&
                 offer.invited &&
