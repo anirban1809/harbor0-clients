@@ -26,8 +26,8 @@ type LifetimeOffer = {
   prices: { terabytes: number; storageBytes: number; amount: number }[];
   currency: string;
   /**
-   * More TB for the account's seat at one price a TB, up to `maxTerabytes` more (10 TB of lifetime
-   * storage in all, so 0 once the seat holds that); null without a seat.
+   * More TB for the account's seat or 500 GB at one price a TB, up to `maxTerabytes` more (10 TB
+   * of lifetime storage in all, so 0 once it holds that); null without lifetime storage.
    */
   addOn: { amountPerTerabyte: number; maxTerabytes: number } | null;
   owned: LifetimeSeat | null;
@@ -42,18 +42,18 @@ const ownedSeat = (offer: LifetimeOffer) =>
   offer.owned && !offer.owned.refundedAt ? offer.owned : undefined;
 /**
  * What this account can buy: with nothing yet, the 500 GB plan when invited and the seats while
- * open. With stacking on (`ltd-stacking`), more TB for its seat, or a seat on top of its 500 GB.
+ * open. With stacking on (`ltd-stacking`), more TB for its seat or 500 GB.
  */
 const choices = (offer: LifetimeOffer, stacking: boolean): LifetimePrice[] => {
   const owned = ownedSeat(offer);
   if (owned && !stacking) return [];
   // Up to the TB left to add: the dialog asks how many, starting from 1.
-  if (owned?.seat)
+  if (owned)
     return offer.addOn && offer.addOn.maxTerabytes >= 1
       ? [{ terabytes: 1, storageBytes: 1e12, amount: offer.addOn.amountPerTerabyte }]
       : [];
   const seats = offer.seatsOpen && !offer.soldOut ? offer.prices : [];
-  return owned ? seats : [...(offer.invited ? [offer.invited] : []), ...seats];
+  return [...(offer.invited ? [offer.invited] : []), ...seats];
 };
 
 export function useLifetimeOffer(api: ApiClient, enabled = true) {
@@ -173,8 +173,8 @@ function LifetimeDialog({
   onClose: () => void;
 }) {
   const owned = ownedSeat(offer);
-  // More TB for an existing seat: no seat to hold, one price a TB.
-  const addingOn = !!owned?.seat;
+  // More TB for an existing seat or 500 GB: no seat to hold, one price a TB.
+  const addingOn = !!owned;
   const [terabytes, setTerabytes] = useState(options[0].terabytes);
   // What's typed in the add-on's TB box, which may be empty or out of range while typing.
   const [typed, setTyped] = useState('1');
@@ -213,7 +213,7 @@ function LifetimeDialog({
       title={addingOn ? 'Add lifetime storage' : 'Lifetime storage'}
       description={
         addingOn
-          ? `Add up to ${most} TB more to your ${lifetimeSize(owned!.terabytes)} lifetime seat, at ${money(offer.addOn!.amountPerTerabyte, offer.currency)} for each TB. One payment, kept for as long as harbor0 runs.`
+          ? `Add up to ${most} TB more to your ${lifetimeSize(owned!.terabytes)} of lifetime storage, at ${money(offer.addOn!.amountPerTerabyte, offer.currency)} for each TB. One payment, kept for as long as harbor0 runs.`
           : `One payment, every feature, for as long as harbor0 runs. ${[
               !owned &&
                 offer.invited &&
@@ -280,7 +280,9 @@ function LifetimeDialog({
         )}
         <ul className="muted lifetime-terms">
           {addingOn ? (
-            <li>It adds to your seat and stays with this account. It can’t be moved.</li>
+            <li>
+              It adds to your lifetime storage and stays with this account. It can’t be moved.
+            </li>
           ) : (
             <li>
               One lifetime seat per account, and you can add storage to it later. It can’t be moved
